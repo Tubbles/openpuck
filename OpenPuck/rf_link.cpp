@@ -11,6 +11,7 @@
 #include "status_led.h"
 #include "fault_diag.h"
 #include "usb_mount.h" // modeSwitchReboot()
+#include "mode_sc2link.h" // OPK_SC2LINK_FORCE
 #include <Adafruit_TinyUSB.h>
 #include <Arduino.h>
 #include <string.h>
@@ -3924,12 +3925,16 @@ uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t *payload, uint8_t plen,
 							want = g_chordDpad
 								[CHD_DOWN];
 					}
+					// A forced SC2 Link build boots into
+					// SC2 Link again, so a held chord would
+					// reboot it in a loop.
 					if (want != 0xFF &&
 					    want == chWant[g_curSlot]) {
 						if (++chCnt[g_curSlot] >= 12 &&
 						    want != g_usbMode &&
 						    modeValid(want) &&
-						    !USBDevice.suspended()) {
+						    !USBDevice.suspended() &&
+						    !OPK_SC2LINK_FORCE) {
 							// clean detach + reboot into the new mode (releases any held
 							// input on the outgoing device -- see modeSwitchReboot)
 							modeSwitchReboot(want);
