@@ -58,7 +58,10 @@
 // SInput: the open SDL-native gamepad protocol (docs.handheldlegend.com/s/sinput). Sticks + analog triggers +
 // gyro/accel + BOTH trackpads + battery, all bound natively by SDL3 / Steam Input with no impersonation.
 #define MODE_SINPUT 12
-#define MODE_MAX 12
+// SC2 Link: one controller as an Xbox 360 pad for Linux xpad plus three HID nodes carrying its raw state, for a
+// client that reads evdev (a TV streaming app). Panel only, no chord.
+#define MODE_SC2LINK 13
+#define MODE_MAX 13
 
 // The two "game" personalities drop the wake-mouse + WebUSB interfaces so the device is a genuine single-HID PS
 // controller (some PC games -- e.g. Fortnite/UE GameInput -- refuse PS classification when extra interfaces are

@@ -10,6 +10,7 @@
 #include "mode_dinput.h"
 #include "mode_sinput.h"
 #include "mode_xbox_og.h"
+#include "mode_sc2link.h"
 
 IController *g_active = nullptr;
 
@@ -48,6 +49,8 @@ IController *controllerFor(uint8_t mode)
 		return &g_dinputCtl;
 	case MODE_SINPUT:
 		return &g_sinputCtl;
+	case MODE_SC2LINK:
+		return &g_sc2LinkCtl;
 	default:
 		return &g_steamPuck;
 	}

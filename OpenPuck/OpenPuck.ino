@@ -67,10 +67,10 @@ using namespace Adafruit_LittleFS_Namespace;
 static uint8_t g_usbCfgDesc[512];
 
 // Per-mode USB serial suffix (modes 1..MODE_MAX: X=xbox N=hori L=lizard P=swpro S=ps5 G=hidgyro Q=ps5game
-// D=ds4game 3=ps3 O=original-xbox J=dinput I=sinput).
+// D=ds4game 3=ps3 O=original-xbox J=dinput I=sinput K=sc2link).
 // 'C' is reserved for the CDC mode, see puck_hid.cpp
-static const char MODE_SUFFIX[] = { 'X', 'N', 'L', 'P', 'S', 'G',
-				    'Q', 'D', '3', 'O', 'J', 'I' };
+static const char MODE_SUFFIX[] = { 'X', 'N', 'L', 'P', 'S', 'G', 'Q',
+				    'D', '3', 'O', 'J', 'I', 'K' };
 // Fixed-interface flags captured at boot so usbReenumerate (dynamic mount, no reboot) replays them.
 static bool s_dynWantWebusb = false, s_dynWantWakeMouse = false;
 
@@ -186,6 +186,9 @@ void setup()
 	// (back-paddle 4 + A) to reach the panel. Normal MODE_PS5 / MODE_HIDGYRO keep wake + panel.
 	const bool psClean = modeIsCleanPS(g_usbMode);
 	const bool xboxClean = g_usbMode == MODE_XBOX;
+	// SC2 Link keeps the panel but not the wake mouse: the host should see no input device besides its own four,
+	// and the panel lands on interface 4, right after them.
+	const bool sc2Link = g_usbMode == MODE_SC2LINK;
 	const bool dynamic = g_active->dynamicMount();
 
 	if (dynamic) {
@@ -247,7 +250,7 @@ void setup()
 		// Boot-mouse wake interface for clean (non-puck) modes, and for puck on the one-shot debug boot (CDC on,
 		// no endpoint room for wake mouse on a normal puck boot -- wake is registered above instead). Skipped for PS
 		// modes so the device stays a single clean HID gamepad (see psClean above).
-		if (!puckMode && !keepCdc && !psClean && !xboxClean)
+		if (!puckMode && !keepCdc && !psClean && !xboxClean && !sc2Link)
 			wakeHidBegin();
 
 		// WebUSB config panel -- every mode EXCEPT the PlayStation modes. Puck: registered above (IF 0) before wake +
@@ -282,7 +285,7 @@ void setup()
 		"HIDGYRO(ds4+motion)",	 "PS5(dualsense,game/clean)",
 		"DS4(ds4,game/clean)",	 "PS3(dualshock3/sixaxis)",
 		"XBOX-OG(controller s)", "DINPUT(joystick+motion)",
-		"SINPUT(sdl-native)"
+		"SINPUT(sdl-native)",	 "SC2LINK(xpad+raw hid)"
 	};
 	Serial.printf("# copycat up: unit=%s board=%s, mode=%s\n", g_unit,
 		      g_board,
