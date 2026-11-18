@@ -73,11 +73,6 @@ static unsigned long g_rumble80Ms[NSLOT] = { 0 };
 // stuck-rumble watchdog is independent
 static bool g_rumble80On[NSLOT] = { false, false, false, false };
 
-// A rumble STOP is relayed as this many copies over successive poll cycles (see hapticSteamRumble): the relay
-// is NO-ACK, and a lost final stop leaves the controller latched rumbling. 3 gives temporal diversity a
-// single-frame RF loss can't wipe out without meaningfully changing steady-state traffic.
-#define RUMBLE_STOP_REPS 3
-
 // ---- relay rings: one per bond slot. Multi-producer (USB ISR + loop-context console/xinput), one consumer
 // per slot (rfConnFlushRelay on that slot's poll turn). Producers serialize under PRIMASK.
 struct RelayMsg {
@@ -110,6 +105,15 @@ bool relayPending()
 	// check the current slot's queue; called from rfConnQueueHapticRelay which runs with g_curSlot set
 	int cur = (g_curSlot >= 0 && g_curSlot < NSLOT) ? g_curSlot : 0;
 	return g_rqHead[cur] != g_rqTail[cur];
+}
+uint8_t relayFree(uint8_t slot)
+{
+	if (slot >= NSLOT)
+		return 0;
+	uint8_t head = g_rqHead[slot], tail = g_rqTail[slot];
+	uint8_t used = (uint8_t)((head + RELAY_QLEN - tail) % RELAY_QLEN);
+	// One entry always stays empty: head == tail means empty.
+	return (uint8_t)(RELAY_QLEN - 1 - used);
 }
 bool relayEnqueue(uint8_t rid, const uint8_t *payload, uint8_t plen,
 		  bool isHaptic, uint8_t slot, bool expectReply)
@@ -327,6 +331,64 @@ static uint32_t isqrt32(uint32_t v)
 	return r;
 }
 
+void hapticRumbleReport(uint16_t left, uint16_t right,
+			uint8_t p[HAPTIC_RUMBLE_LEN])
+{
+	// SDL's current Steam/Triton structs define output report 0x80 as:
+	//   type, uint16 intensity, {uint16 speed, int8 gain} left/right.
+	// We map conventional gamepad low/high-frequency motors to left/right speeds and use max as intensity.
+	uint16_t intensity = left > right ? left : right;
+
+	// haptic_type_t::HAPTIC_TYPE_RUMBLE; 0 is the off/zero report
+	p[0] = (left || right) ? 0x04 : 0x00;
+	p[1] = (uint8_t)(intensity & 0xFF);
+	p[2] = (uint8_t)(intensity >> 8);
+	p[3] = (uint8_t)(left & 0xFF);
+	p[4] = (uint8_t)(left >> 8);
+	p[5] = 0;
+	p[6] = (uint8_t)(right & 0xFF);
+	p[7] = (uint8_t)(right >> 8);
+	p[8] = 0;
+}
+
+bool hapticRumbleQueue(const uint8_t p[HAPTIC_RUMBLE_LEN], uint8_t slot)
+{
+	if (slot >= NSLOT)
+		return false;
+	bool on = p[0] != 0;
+	// per-type rumble disable: drop ON commands; zero/stop still pass to clear any queued relay
+	if (on && !g_rumble)
+		return false;
+	// Per-slot settle gate (the per-slot reconnect block + link-up check). 0x82 haptics in Steam mode use the
+	// same gate; for XInput, the host only sends a stream while a controller is connected, so this also doubles
+	// as "no controller here, no relay".
+	if (on && haptic82Blocked(slot))
+		return false;
+	if (!on && !hapticLinkUp(slot))
+		return false;
+
+	// The RF relay is NO-ACK -- any single frame can be lost. For an ON that's self-healing: a continuous
+	// stream of rumble commands follows during play, so a dropped frame is corrected microseconds later. A
+	// STOP is the dangerous one: if the host's FINAL zero (game/stream quit) -- or the watchdog's stop below
+	// -- is the last frame on the wire and it's lost, the controller stays latched rumbling with nothing left
+	// to correct it (the reported "constant rumble that didn't stop after closing GFN", cleared only by a
+	// replug). And once we optimistically mark g_rumble80On=false, the watchdog can't rescue it either. So
+	// relay a STOP as a short BURST: rfConnFlushRelay drains one ring entry per poll cycle, so N copies go out
+	// on successive cycles (~4ms apart) -- temporal diversity that a single-frame RF loss can't wipe out.
+	// Bursting only the on->off transition leaves steady-state (repeated-ON / repeated-OFF) traffic unchanged.
+	bool stopping = !on && g_rumble80On[slot];
+	uint8_t reps = stopping ? RUMBLE_STOP_REPS : 1;
+	bool queued = false;
+	for (uint8_t i = 0; i < reps; i++)
+		if (relayEnqueue(0x80, p, HAPTIC_RUMBLE_LEN, true, slot))
+			queued = true;
+	if (!queued)
+		return false;
+	g_rumble80Ms[slot] = millis();
+	g_rumble80On[slot] = on;
+	return true;
+}
+
 bool hapticSteamRumble(uint16_t lowFreq, uint16_t highFreq, uint8_t slot)
 {
 	if (slot >= NSLOT)
@@ -367,54 +429,9 @@ bool hapticSteamRumble(uint16_t lowFreq, uint16_t highFreq, uint8_t slot)
 		lowFreq = (l > 0xFFFF) ? 0xFFFF : (uint16_t)l;
 		highFreq = (h > 0xFFFF) ? 0xFFFF : (uint16_t)h;
 	}
-	bool on = lowFreq || highFreq;
-	// per-type rumble disable: drop ON commands; zero/stop still pass to clear any queued relay
-	if (on && !g_rumble)
-		return false;
-	// Per-slot settle gate (the per-slot reconnect block + link-up check). 0x82 haptics in Steam mode use the
-	// same gate; for XInput, the host only sends a stream while a controller is connected, so this also doubles
-	// as "no controller here, no relay".
-	if (on && haptic82Blocked(slot))
-		return false;
-	if (!on && !hapticLinkUp(slot))
-		return false;
-
-	// SDL's current Steam/Triton structs define output report 0x80 as:
-	//   type, uint16 intensity, {uint16 speed, int8 gain} left/right.
-	// We map conventional gamepad low/high-frequency motors to left/right speeds and use max as intensity.
-	uint16_t intensity = lowFreq > highFreq ? lowFreq : highFreq;
-	uint8_t p[9];
-
-	// haptic_type_t::HAPTIC_TYPE_RUMBLE; 0 is the off/zero report
-	p[0] = on ? 0x04 : 0x00;
-	p[1] = (uint8_t)(intensity & 0xFF);
-	p[2] = (uint8_t)(intensity >> 8);
-	p[3] = (uint8_t)(lowFreq & 0xFF);
-	p[4] = (uint8_t)(lowFreq >> 8);
-	p[5] = 0;
-	p[6] = (uint8_t)(highFreq & 0xFF);
-	p[7] = (uint8_t)(highFreq >> 8);
-	p[8] = 0;
-	// The RF relay is NO-ACK -- any single frame can be lost. For an ON that's self-healing: a continuous
-	// stream of rumble commands follows during play, so a dropped frame is corrected microseconds later. A
-	// STOP is the dangerous one: if the host's FINAL zero (game/stream quit) -- or the watchdog's stop below
-	// -- is the last frame on the wire and it's lost, the controller stays latched rumbling with nothing left
-	// to correct it (the reported "constant rumble that didn't stop after closing GFN", cleared only by a
-	// replug). And once we optimistically mark g_rumble80On=false, the watchdog can't rescue it either. So
-	// relay a STOP as a short BURST: rfConnFlushRelay drains one ring entry per poll cycle, so N copies go out
-	// on successive cycles (~4ms apart) -- temporal diversity that a single-frame RF loss can't wipe out.
-	// Bursting only the on->off transition leaves steady-state (repeated-ON / repeated-OFF) traffic unchanged.
-	bool stopping = !on && g_rumble80On[slot];
-	uint8_t reps = stopping ? RUMBLE_STOP_REPS : 1;
-	bool queued = false;
-	for (uint8_t i = 0; i < reps; i++)
-		if (relayEnqueue(0x80, p, sizeof p, true, slot))
-			queued = true;
-	if (!queued)
-		return false;
-	g_rumble80Ms[slot] = millis();
-	g_rumble80On[slot] = on;
-	return true;
+	uint8_t p[HAPTIC_RUMBLE_LEN];
+	hapticRumbleReport(lowFreq, highFreq, p);
+	return hapticRumbleQueue(p, slot);
 }
 // Queue a pending test-haptic / stop relay (runs inside the poll cadence -- never at raw loop rate). Test
 // haptics broadcast to all connected slots (slot 0xFF); the stop frame is broadcast too (a stuck latch can

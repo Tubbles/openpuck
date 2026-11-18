@@ -112,6 +112,9 @@ extern uint16_t
 
 // anything still queued (xinput uses it to pace rumble re-queues)
 bool relayPending();
+// Free entries in one slot's ring, for a caller that holds a report back
+// rather than let relayEnqueue evict a queued one.
+uint8_t relayFree(uint8_t slot);
 extern uint8_t g_relayOp; // relay frame opcode (E3 poll)
 extern uint8_t g_relaySub; // relay sub-TLV type byte = SET
 extern volatile uint8_t g_testHaptic; // 't<n>' injects n test haptics
@@ -158,6 +161,18 @@ bool hapticRelaySlotOk(int slot);
 // defaults to 0 for the legacy single-controller callers. Per-slot so each connected controller can have its
 // own active rumble stream when the host presents multiple gamepads (e.g. 4 XInput devices).
 bool hapticSteamRumble(uint16_t lowFreq, uint16_t highFreq, uint8_t slot = 0);
+// A rumble STOP is relayed as this many copies over successive poll cycles
+// (see hapticRumbleQueue): the relay is NO-ACK, and a lost final stop leaves
+// the controller latched rumbling. 3 gives temporal diversity a single-frame
+// RF loss can't wipe out without meaningfully changing steady-state traffic.
+#define RUMBLE_STOP_REPS 3
+#define HAPTIC_RUMBLE_LEN 9
+// The 0x80 payload (no report id) for two motor speeds, unshaped.
+void hapticRumbleReport(uint16_t left, uint16_t right,
+			uint8_t p[HAPTIC_RUMBLE_LEN]);
+// Relays a 0x80 payload as built. The rumble gates, the stop burst and the
+// stuck-rumble watchdog apply, the style and scale of hapticSteamRumble do not.
+bool hapticRumbleQueue(const uint8_t p[HAPTIC_RUMBLE_LEN], uint8_t slot);
 
 // queue + flush the pending host/test/stop relay inside the poll cadence (called from rf_link).
 // rfConnFlushRelay's s1 must carry a PID distinct from the GET poll that follows it. g_relayPid
