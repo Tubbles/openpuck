@@ -63,6 +63,8 @@ enum Sc2Op {
 // CONTROL subs, header bits 12 to 8.
 #define SC2_CTL_NOP 0x00
 #define SC2_CTL_BYE 0x02
+// A test aid: its ACK_ECHO is the CRC of the last queued report.
+#define SC2_CTL_CHECKSUM 0x04
 #define SC2_CTL_BOOTLOADER 0x05
 #define SC2_CTL_MODE 0x06
 // The commands that reboot take effect only with this payload word, so a
@@ -298,6 +300,10 @@ struct Sc2Session {
 	uint8_t rumble[HAPTIC_RUMBLE_LEN];
 	bool rumbleOn;
 	unsigned long rumbleMs;
+	// The report the last report-building message queued, for CHECKSUM.
+	// Length 0 when that message's report was dropped.
+	uint8_t report[SC2_REPORT_MAX];
+	uint8_t reportLength;
 };
 
 static Sc2Session g_sc2Session;
@@ -695,6 +701,7 @@ static int8_t sc2ControlWords(uint16_t header)
 	switch (sc2ControlSub(header)) {
 	case SC2_CTL_NOP:
 	case SC2_CTL_BYE:
+	case SC2_CTL_CHECKSUM:
 		return argument ? -1 : 0;
 	case SC2_CTL_BOOTLOADER:
 		// No UF2 mode without the Adafruit bootloader.
@@ -868,6 +875,20 @@ static void sc2StartSession(unsigned long ms)
 	session.wordMs = ms;
 }
 
+// CRC-16/CCITT-FALSE: polynomial 0x1021, initial value 0xFFFF, no reflection
+// and no final XOR, which is Python's binascii.crc_hqx(data, 0xFFFF).
+static uint16_t sc2Crc16(const uint8_t *bytes, uint8_t length)
+{
+	uint16_t crc = 0xFFFF;
+	for (uint8_t i = 0; i < length; i++) {
+		crc ^= (uint16_t)(bytes[i] << 8);
+		for (uint8_t bit = 0; bit < 8; bit++)
+			crc = (crc & 0x8000) ? (uint16_t)(crc << 1 ^ 0x1021) :
+					       (uint16_t)(crc << 1);
+	}
+	return crc;
+}
+
 // A complete message. Returns what ACK_ECHO shows for it.
 static uint16_t sc2Run(uint16_t last)
 {
@@ -876,6 +897,8 @@ static uint16_t sc2Run(uint16_t last)
 		uint8_t sub = sc2ControlSub(session.header);
 		if (sub == SC2_CTL_BYE)
 			sc2EndSession();
+		else if (sub == SC2_CTL_CHECKSUM)
+			return sc2Crc16(session.report, session.reportLength);
 		else if (sub == SC2_CTL_BOOTLOADER)
 			g_sc2Reboot = SC2_REBOOT_UF2;
 		else if (sub == SC2_CTL_MODE)
@@ -885,7 +908,8 @@ static uint16_t sc2Run(uint16_t last)
 	uint8_t report[SC2_REPORT_MAX];
 	uint8_t length =
 		sc2BuildReport(session.header, session.payload, report);
-	sc2QueueReport(report, length);
+	session.reportLength = sc2QueueReport(report, length) ? length : 0;
+	memcpy(session.report, report, session.reportLength);
 	return last;
 }
 

@@ -476,7 +476,7 @@ then per word uploads `FF_RUMBLE` with strong = `word & 0xFF00`, weak = `(word &
 playing effect (`EVIOCSFF`) and writes an `EV_FF` play event. xpad sends `00 08 00 SS WW 00 00 00`, and the
 word is `SS << 8 | WW`. The dongle answers on the pads node:
 
-- `ACK_ECHO` (`ABS_GAS`): the last accepted word.
+- `ACK_ECHO` (`ABS_GAS`): the last accepted word, or for CHECKSUM a checksum.
 - `ACK_STATE` (`ABS_BRAKE`):
 
 | Bits | Content |
@@ -545,12 +545,20 @@ gains 0. Example: a click on both pads at −10 dB is COMMAND `0x3AF6`, report `
 |---|---|---|---|---|
 | `0x00` | NOP | 0 | none | keeps the session |
 | `0x02` | BYE | 0 | none | ends the session |
+| `0x04` | CHECKSUM | 0 | none | `ACK_ECHO` shows a checksum instead of the word (below) |
 | `0x05` | BOOTLOADER | 0 | `0x5546` | reboots into the UF2 bootloader like the knock and panel `0x0C`; rejected on boards without the Adafruit bootloader |
 | `0x06` | MODE | mode number | `0x4D00` \| mode | stores the mode as panel `0x03` does and reboots into it; rejected for an invalid mode |
 
 The rebooting commands act only on their confirmation word, so a client that lost count cannot reboot the
 dongle with one stray word. The dongle acknowledges the confirmation, stops the rumble, and reboots 50 ms
 later. A build with `OPK_SC2LINK_FORCE` boots into SC2 Link whatever mode was stored.
+
+CHECKSUM is a test aid. Its acknowledgement advances the counter as usual, but `ACK_ECHO` holds the
+CRC-16/CCITT-FALSE (polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR; Python's
+`binascii.crc_hqx(data, 0xFFFF)`) of the report the last report-building message queued for the controller,
+report id included: `82 03 02 F6` for the example above. It is `0xFFFF` (the CRC of nothing) when that
+message's report was not queued, for instance with no controller linked. RUMBLE resends and session-end stops
+are not messages and leave it alone. A host compares it with the CRC of the report it expects.
 
 ## 10. WebUSB control channel
 
