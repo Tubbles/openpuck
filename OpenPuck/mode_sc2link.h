@@ -9,6 +9,8 @@ class SC2LinkController : public IController {
 	void begin() override;
 	void onReport45(int slot, const uint8_t *rep, bool fresh,
 			uint8_t bodyTlen) override;
+	void onAuxReport(int slot, uint8_t rid, const uint8_t *data,
+			 uint8_t n) override;
 	void task() override;
 	void usbIdentity() override;
 };

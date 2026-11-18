@@ -3,6 +3,7 @@
 // binds. setup() adds the WebUSB panel after them as interface 4.
 #include "mode_sc2link.h"
 #include "mode_xinput.h"
+#include "gamepad_util.h"
 #include "triton.h"
 #include "config.h"
 #include "haptics.h"
@@ -22,6 +23,26 @@ SC2LinkController g_sc2LinkCtl;
 // The Xbox report reads through byte 27, and rf_link passes on no shorter
 // state report.
 #define SC2_STATE_MIN_LEN 28
+// rf_link releases input with a synthetic neutral state this long after the
+// last reply. It is no RF state, so it does not advance the sample counter.
+#define SC2_LIVE_MS 300u
+
+#define SC2_CONTROLS_LEN 20
+#define SC2_CONTROLS_STATUS_AT 14
+#define SC2_PADS_LEN 18
+#define SC2_MOTION_LEN 12
+
+// Offsets in a 0x45 or 0x42 state: [id][seq][buttons u32][lt][rt][lx][ly]
+// [rx][ry][left pad x, y, pressure][right pad x, y, pressure][IMU time u32]
+// [accel x, y, z][gyro x, y, z], 16-bit fields little endian. 0x47 puts a
+// 16-bit trackpad time in front of the pads and shortens the IMU time.
+#define SC2_REP_BUTTONS 2
+#define SC2_REP_TRIGGERS 6
+#define SC2_REP_STICKS 10
+#define SC2_REP_PADS 18
+#define SC2_REP_PADS_47 20
+#define SC2_REP_IMU 34
+#define SC2_REP_FULL_LEN 46
 
 // Interface 0 of a genuine wired pad, its 0x21 descriptor included, without
 // the audio, plugin and security interfaces that follow it there: Linux binds
@@ -196,6 +217,17 @@ static Sc2Usb g_sc2Usb;
 // Loop only: the bond whose input feeds every interface.
 static int8_t g_sc2Bond = -1;
 
+struct Sc2Battery {
+	bool known;
+	uint8_t chargeState, percent;
+};
+
+// Loop only. The controls report is kept whole for the battery reports that
+// arrive between states.
+static uint16_t g_sc2Counter;
+static Sc2Battery g_sc2Battery;
+static uint8_t g_sc2ControlsReport[SC2_CONTROLS_LEN];
+
 // Only before attach or after TinyUSB has dropped the endpoints.
 static void sc2UsbClear(void)
 {
@@ -360,6 +392,58 @@ static void sc2XboxDrain(void)
 	}
 }
 
+// Bit 0 controller connected, bits 1 to 3 EChargeState, bits 4 to 10 battery
+// percent, bit 11 battery known.
+static uint16_t sc2Status(const Sc2Battery &battery)
+{
+	uint8_t percent = battery.percent > 127 ? 127 : battery.percent;
+	uint16_t status = 1u | (uint16_t)((battery.chargeState & 7u) << 1) |
+			  (uint16_t)(percent << 4);
+	if (battery.known)
+		status |= 1u << 11;
+	return status;
+}
+
+static void sc2BuildControls(uint8_t out[SC2_CONTROLS_LEN], const uint8_t *rep,
+			     uint16_t counter, uint16_t status)
+{
+	le16(out, (int16_t)counter);
+	memcpy(out + 2, rep + SC2_REP_BUTTONS, 4);
+	memcpy(out + 6, rep + SC2_REP_STICKS, 8);
+	le16(out + SC2_CONTROLS_STATUS_AT, (int16_t)status);
+	memcpy(out + 16, rep + SC2_REP_TRIGGERS, 4);
+}
+
+// False when the report ends before the pads. The last two fields will carry
+// the output protocol's acknowledgement and stay zero until it exists.
+static bool sc2BuildPads(uint8_t out[SC2_PADS_LEN], const uint8_t *rep,
+			 uint8_t length)
+{
+	uint8_t at = rep[0] == OPK_TRITON_REPORT_STATE_TIMESTAMP ?
+			     SC2_REP_PADS_47 :
+			     SC2_REP_PADS;
+	if (length < at + 12)
+		return false;
+	uint32_t buttons = btnsOf(rep);
+	memset(out, 0, SC2_PADS_LEN);
+	memcpy(out, rep + at, 12);
+	// A copy of the touch bits, since frames of different nodes reach a
+	// client in no fixed order and a touch must arrive with its position.
+	out[12] = (uint8_t)(((buttons & TB_LPADT) ? 1 : 0) |
+			    ((buttons & TB_RPADT) ? 2 : 0));
+	return true;
+}
+
+// False when the report ends before the IMU.
+static bool sc2BuildMotion(uint8_t out[SC2_MOTION_LEN], const uint8_t *rep,
+			   uint8_t length)
+{
+	if (length < SC2_REP_FULL_LEN)
+		return false;
+	memcpy(out, rep + SC2_REP_IMU, SC2_MOTION_LEN);
+	return true;
+}
+
 static void sc2PublishXbox(const uint8_t report[XINPUT_REPORT_LEN])
 {
 	uint32_t pm = __get_PRIMASK();
@@ -369,10 +453,16 @@ static void sc2PublishXbox(const uint8_t report[XINPUT_REPORT_LEN])
 	__set_PRIMASK(pm);
 }
 
+// Releases every input with the connected bit clear. The counter keeps its
+// value, and motion is left as is: nothing in it reads as held.
 static void sc2PublishNeutral(void)
 {
 	uint8_t xbox[XINPUT_REPORT_LEN] = { 0, XINPUT_REPORT_LEN };
+	uint8_t pads[SC2_PADS_LEN] = {};
 	sc2PublishXbox(xbox);
+	memset(g_sc2ControlsReport + 2, 0, SC2_CONTROLS_LEN - 2);
+	usbTxHid(&g_sc2Controls, 0, g_sc2ControlsReport, SC2_CONTROLS_LEN);
+	usbTxHid(&g_sc2Pads, 0, pads, sizeof pads);
 }
 
 static bool sc2BondRecent(int slot, unsigned long now)
@@ -391,6 +481,7 @@ static void sc2UpdateBond(void)
 		return;
 	if (g_sc2Bond >= 0) {
 		g_sc2Bond = -1;
+		g_sc2Battery = Sc2Battery();
 		sc2PublishNeutral();
 	}
 	for (int slot = 0; slot < NSLOT; slot++) {
@@ -472,9 +563,33 @@ void SC2LinkController::onReport45(int slot, const uint8_t *rep, bool fresh,
 	if (!fresh || !rep || slot < 0 || slot != g_sc2Bond ||
 	    !sc2StateReport(rep, bodyTlen))
 		return;
+	if (millis() - g_connReplyMs[slot] < SC2_LIVE_MS)
+		g_sc2Counter++;
+	sc2BuildControls(g_sc2ControlsReport, rep, g_sc2Counter,
+			 sc2Status(g_sc2Battery));
+	usbTxHid(&g_sc2Controls, 0, g_sc2ControlsReport, SC2_CONTROLS_LEN);
+	uint8_t pads[SC2_PADS_LEN], motion[SC2_MOTION_LEN];
+	if (sc2BuildPads(pads, rep, bodyTlen))
+		usbTxHid(&g_sc2Pads, 0, pads, sizeof pads);
+	if (sc2BuildMotion(motion, rep, bodyTlen))
+		usbTxHid(&g_sc2Motion, 0, motion, sizeof motion);
 	uint8_t xbox[XINPUT_REPORT_LEN];
 	xinputBuildReport(rep, xbox);
 	sc2PublishXbox(xbox);
+}
+
+void SC2LinkController::onAuxReport(int slot, uint8_t rid, const uint8_t *data,
+				    uint8_t n)
+{
+	// 0x43 starts with EChargeState and the battery percent.
+	if (slot < 0 || slot != g_sc2Bond || rid != 0x43 || n < 2)
+		return;
+	g_sc2Battery.known = true;
+	g_sc2Battery.chargeState = data[0];
+	g_sc2Battery.percent = data[1];
+	le16(g_sc2ControlsReport + SC2_CONTROLS_STATUS_AT,
+	     (int16_t)sc2Status(g_sc2Battery));
+	usbTxHid(&g_sc2Controls, 0, g_sc2ControlsReport, SC2_CONTROLS_LEN);
 }
 
 void SC2LinkController::task()
