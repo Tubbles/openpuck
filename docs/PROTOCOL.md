@@ -597,8 +597,8 @@ RUMBLE resends leave it alone. It is `0xFFFF` (the CRC of nothing) when that rep
 instance with no controller linked. A host compares it with the CRC of the report it expects.
 
 `tools/sc2link/sc2link_test.py` speaks this protocol from a Linux host: decoded nodes, single messages,
-a selftest of every message and rule, and the reboot commands (`--help`). `test_sc2link.py` beside it checks
-its encoder and parser model without a dongle.
+a selftest of every message and rule whose effects each end within a second, and the reboot commands
+(`--help`). `test_sc2link.py` beside it checks its encoder and parser model without a dongle.
 
 ## 10. WebUSB control channel
 

@@ -278,8 +278,9 @@ def report_tone(side, gain, frequency_hz, duration_ms, lfo_hz, lfo_depth):
                        duration_ms, lfo_hz, lfo_depth)
 
 
-# The OFF command on both pads, which a session's start and end send to stop
-# every haptic. CHECKSUM covers the one a session end queues.
+# The OFF command a session's start and end send, meant for both pads. Side 3
+# of 0x82 is the left internal actuator, so it does not stop the pads.
+# CHECKSUM covers the one a session end queues.
 STOP_REPORT = report_command(3, 0, 0)
 
 
@@ -303,8 +304,14 @@ def word_field(name):
     return Field(name, 0, 0xFFFF)
 
 
+# The side byte names other actuators per report (docs/PROTOCOL.md 9.5.1).
+# Pulse: 0 right pad, 1 left pad, 2 both pads. The others: 0 left pad, 1 right
+# pad, 2 both pads, 3 left internal actuator. None is silent.
 SIDE = Field("side", 0, 3)
 GAIN = Field("gain", -128, 127)
+COMMAND = Field("command", 0, 7)
+ON_US = word_field("on_us")
+DURATION_MS = word_field("duration_ms")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -316,20 +323,20 @@ class Message:
 
 
 MESSAGES = {message.name: message for message in (
-    Message("command", (SIDE, Field("command", 0, 7), GAIN),
+    Message("command", (SIDE, COMMAND, GAIN),
             encode_command, report_command),
     Message("script", (SIDE, Field("script", 0, 0xFF), GAIN),
             encode_script, report_script),
     Message("rumble", (word_field("left"), word_field("right")),
             encode_rumble, report_rumble),
-    Message("pulse", (SIDE, word_field("on_us"), word_field("off_us"),
+    Message("pulse", (SIDE, ON_US, word_field("off_us"),
                       word_field("repeat")),
             encode_pulse, report_pulse),
-    Message("sweep", (SIDE, GAIN, word_field("duration_ms"),
+    Message("sweep", (SIDE, GAIN, DURATION_MS,
                       word_field("start_hz"), word_field("end_hz")),
             encode_sweep, report_sweep),
     Message("tone", (SIDE, GAIN, word_field("frequency_hz"),
-                     word_field("duration_ms"), word_field("lfo_hz"),
+                     DURATION_MS, word_field("lfo_hz"),
                      Field("lfo_depth", 0, 0xFF)),
             encode_tone, report_tone),
 )}
@@ -338,8 +345,7 @@ MESSAGES = {message.name: message for message in (
 def boundary_cases(message):
     """Every field at its minimum, middle and maximum, one field at a time.
 
-    The other fields stay at their minimum: side 0 (none), gain -128 dB and
-    zero durations, so the long effects among the cases stay silent and short.
+    The other fields stay at their minimum.
     """
     base = tuple(field.minimum for field in message.fields)
     cases = [base]
@@ -1371,7 +1377,8 @@ def selftest_plain(test):
     test.link.acks.refresh()
     test.model = Model(test.link.acks.counter(), test.model.linked)
     problems = []
-    for word in (0x1010, 0x0000):
+    # Both motors at 1 of 255 for the 100 ms the tool listens, then off.
+    for word in (0x0101, 0x0000):
         problems += test.step(word)
     test.record("plain rumble outside a session is not acknowledged",
                 problems)
@@ -1381,10 +1388,27 @@ def selftest_plain(test):
         test.model = Model(test.link.acks.counter(), test.model.linked)
 
 
+# Each effect the selftest starts ends within a second. Commands above CLICK
+# are undefined for 0x82. A tone or sweep plays for its duration, a tone of
+# 0 ms forever (reverse engineered). 300 ms still sets the high byte.
+SELFTEST_RANGES = {COMMAND: Field("command", 0, 2),
+                   DURATION_MS: Field("duration_ms", 1, 300)}
+# The value of a field that plays least: OFF, no on time (a pulse without one
+# plays nothing), the shortest tone or sweep.
+QUIETEST = {SIDE: 0, GAIN: GAIN.minimum, COMMAND: 0, ON_US: 0,
+            DURATION_MS: 1}
+
+
+def selftest_message(message):
+    """The message with the field ranges the selftest keeps to."""
+    return dataclasses.replace(message, fields=tuple(
+        SELFTEST_RANGES.get(field, field) for field in message.fields))
+
+
 def selftest_messages(test):
     started = time.monotonic()
     words_before = test.words
-    for message in MESSAGES.values():
+    for message in map(selftest_message, MESSAGES.values()):
         failed = 0
         cases = boundary_cases(message)
         for values in cases:
@@ -1407,15 +1431,15 @@ def doubled(words):
     return [word for word in words for _ in range(2)]
 
 
-def silent_maximum(field):
-    """Wide fields at their maximum, side none and gain at -128 dB."""
-    return {SIDE: SIDE.minimum, GAIN: GAIN.minimum}.get(field, field.maximum)
+def quiet_maximum(field):
+    """The quietest value where a field has one, else its maximum."""
+    return QUIETEST.get(field, field.maximum)
 
 
 def selftest_copies(test):
     """Every word twice: each copy is acknowledged again, not taken."""
     for message in MESSAGES.values():
-        values = tuple(map(silent_maximum, message.fields))
+        values = tuple(map(quiet_maximum, message.fields))
         data_words = message.encode(*values) + [CHECKSUM]
         if message.name == "rumble":
             data_words += encode_rumble_stop()
@@ -1450,10 +1474,11 @@ def selftest_framing(test):
     for name, data_words in rejected:
         test.case(name, test.stamp(data_words))
         test.hello("HELLO after it opens a new session")
-    # A click sent after a PULSE header is the pulse's on time.
-    click = encode_command(3, 2, -10)[0]
+    # A click on both pads sent after a PULSE header is the off time of a
+    # pulse that plays nothing.
+    click = encode_command(2, 2, -10)[0]
     test.case("a one-word message inside a longer one is payload",
-              test.stamp(encode_pulse(3, click, 0, 1) + [CHECKSUM]))
+              test.stamp(encode_pulse(0, 0, click, 0) + [CHECKSUM]))
 
 
 def time_out(test, name):
@@ -1481,14 +1506,11 @@ def selftest_truncated(test):
 
 
 def selftest_stop(test):
-    """A pulse train that only the session timeout can stop."""
-    if not test.model.linked:
-        print("SKIP the session timeout stops a pulse train: no controller")
-        return
-    pulse = encode_pulse(3, 20000, 20000, 1000)
-    if not test.case("a 40 s pulse train on both pads starts",
-                     test.stamp(pulse)):
-        return
+    """NOPs hold a session, silence ends it with its stop.
+
+    Nothing plays meanwhile: an effect that lasts until the stop would run
+    longer than a second, and the stop's OFF does not reach the pads.
+    """
     problems = []
     for _ in range(5):
         test.link.quiet(IDLE_NOP_S)
@@ -1498,8 +1520,6 @@ def selftest_stop(test):
         test.restart()
         return
     time_out(test, "the session times out")
-    print("CHECK by hand: both pads fell silent about 0.5 s after the last "
-          "NOP. The tool cannot feel the controller.")
     test.hello("HELLO after the timeout opens a new session")
     test.case("CHECKSUM shows the OFF report the timeout queued",
               test.stamp([CHECKSUM]))
@@ -1531,7 +1551,7 @@ def command_selftest(args):
         selftest_framing(test)
         selftest_truncated(test)
         selftest_stop(test)
-        test.case("clean up: BYE stops every haptic", test.stamp([BYE]))
+        test.case("clean up: BYE ends the session", test.stamp([BYE]))
         failed = sum(1 for _, problems in test.results if problems)
         times = sorted(link.round_trips_ns)
         print(f"words acknowledged: {len(times)}, resends: {link.resends}")
@@ -1570,7 +1590,9 @@ def build_parser():
         description="Fields: " + "; ".join(
             f"{message.name} " + " ".join(field.name.upper()
                                           for field in message.fields)
-            for message in MESSAGES.values()) + "; rumble stop.")
+            for message in MESSAGES.values()) + "; rumble stop. SIDE of a "
+        "pulse: 0 right pad, 1 left pad, 2 both pads. Of the others: 0 left "
+        "pad, 1 right pad, 2 both pads, 3 left internal actuator.")
     send.add_argument("message", choices=sorted(MESSAGES))
     send.add_argument("fields", nargs="*", help="field values, 0x for hex")
     send.add_argument("--hold", type=float, default=0.0, metavar="SECONDS",
