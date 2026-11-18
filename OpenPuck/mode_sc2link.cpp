@@ -5,9 +5,11 @@
 #include "mode_xinput.h"
 #include "gamepad_util.h"
 #include "triton.h"
+#include "board_config.h"
 #include "config.h"
 #include "haptics.h"
 #include "bonds.h"
+#include "fault_diag.h"
 #include "usb_tx.h"
 #include "usb_app_drivers.h"
 #include <Adafruit_TinyUSB.h>
@@ -304,13 +306,62 @@ static bool sc2RumblePacket(const uint8_t *data, uint32_t length,
 	return true;
 }
 
+// A host that reaches the pad only through its event node (a TV app, a desktop
+// user without usbfs access) has no panel. For it, four rumble packets in a
+// row, each within 500 ms of the one before, reboot into the UF2 bootloader.
+// The first three still rumble. The word protocol's session commands will
+// replace this.
+static const uint8_t SC2_BOOT_KNOCK[][2] = {
+	{ 0x55, 0x46 },
+	{ 0x32, 0xB0 },
+	{ 0x4F, 0x4B },
+	{ 0x21, 0x21 },
+};
+static const uint8_t SC2_BOOT_KNOCK_STEPS =
+	sizeof SC2_BOOT_KNOCK / sizeof SC2_BOOT_KNOCK[0];
+#define SC2_BOOT_KNOCK_GAP_MS 500u
+// Long enough for the rumble stop burst to leave on the following RF polls.
+#define SC2_BOOT_DELAY_MS 50u
+
+// Set on the usbd task, acted on by the loop.
+static volatile bool g_sc2BootRequest;
+
+static bool sc2KnockStep(uint8_t step, uint8_t strong, uint8_t weak)
+{
+	return strong == SC2_BOOT_KNOCK[step][0] &&
+	       weak == SC2_BOOT_KNOCK[step][1];
+}
+
+// usbd task only. True for the packet that completes the sequence.
+static bool sc2BootKnock(uint8_t strong, uint8_t weak, unsigned long now)
+{
+	static uint8_t matched;
+	static unsigned long lastMs;
+	if (matched && (now - lastMs > SC2_BOOT_KNOCK_GAP_MS ||
+			!sc2KnockStep(matched, strong, weak)))
+		matched = 0;
+	if (!sc2KnockStep(matched, strong, weak))
+		return false;
+	lastMs = now;
+	if (++matched < SC2_BOOT_KNOCK_STEPS)
+		return false;
+	matched = 0;
+	return true;
+}
+
 // Every OUT packet arrives here, on the usbd task. A parser for words carried
 // in rumble packets goes in front of the plain rumble below.
 static void sc2OnOut(const uint8_t *data, uint32_t length)
 {
 	uint8_t strong, weak;
-	if (!sc2RumblePacket(data, length, &strong, &weak))
+	if (g_sc2BootRequest || !sc2RumblePacket(data, length, &strong, &weak))
 		return;
+	// Boards without the Adafruit bootloader have no UF2 mode, so the
+	// panel's opcode 0x0C is off there too.
+	if (OPK_HAS_ADAFRUIT_DFU && sc2BootKnock(strong, weak, millis())) {
+		g_sc2BootRequest = true;
+		return;
+	}
 	uint32_t pm = __get_PRIMASK();
 	__disable_irq();
 	g_sc2Usb.rumbleLow = (uint16_t)strong * 257u;
@@ -511,6 +562,27 @@ static void sc2RelayRumble(void)
 		hapticSteamRumble(low, high, (uint8_t)g_sc2Bond);
 }
 
+// Stops the rumble the knock's first packets started, then reboots the way the
+// panel's opcode 0x0C does.
+static void sc2BootTask(void)
+{
+	static bool stopped;
+	static unsigned long stopMs;
+	if (!g_sc2BootRequest)
+		return;
+	if (!stopped) {
+		stopped = true;
+		stopMs = millis();
+		if (g_sc2Bond >= 0)
+			hapticSteamRumble(0, 0, (uint8_t)g_sc2Bond);
+		return;
+	}
+	if (millis() - stopMs < SC2_BOOT_DELAY_MS)
+		return;
+	faultDiagArmIntentionalReset();
+	enterUf2Dfu();
+}
+
 static bool sc2StateReport(const uint8_t *rep, uint8_t length)
 {
 	return length >= SC2_STATE_MIN_LEN &&
@@ -596,4 +668,5 @@ void SC2LinkController::task()
 {
 	sc2UpdateBond();
 	sc2RelayRumble();
+	sc2BootTask();
 }
