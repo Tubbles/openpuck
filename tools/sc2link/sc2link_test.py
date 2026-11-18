@@ -855,8 +855,18 @@ class Link:
         self.acks.poll(0)
         self.acks.frames.clear()
 
-    def send(self, word):
-        """Stop-and-wait: one word, its acknowledgement or None."""
+    def state(self):
+        """ACK_STATE now: the events read, then the kernel's value."""
+        self.drain()
+        self.acks.refresh()
+        return self.acks.state
+
+    def send(self, word, in_session=False):
+        """Stop-and-wait: one word, its acknowledgement or None.
+
+        A session word is not resent once the session bit is clear: outside
+        a session it would be rumble.
+        """
         self.drain()
         before = self.acks.counter()
         for resend in range(MAX_RESENDS + 1):
@@ -869,6 +879,9 @@ class Link:
                 if self.acks.counter() != before:
                     frame = (time.monotonic_ns(), self.acks.echo,
                              self.acks.state)
+                elif in_session and not self.acks.state >> 7 & 1:
+                    self.resends += resend
+                    return None
             if frame is not None:
                 round_trip = max(frame[0] - sent_ns, 0)
                 self.round_trips_ns.append(round_trip)
@@ -909,7 +922,7 @@ class Link:
 
 def format_ack(ack, label=""):
     if ack is None:
-        return f"{label}no acknowledgement after {MAX_RESENDS} resends"
+        return f"{label}no acknowledgement"
     resent = f", {ack.resends} resends" if ack.resends else ""
     jump = f", counter +{ack.advance}" if ack.advance != 1 else ""
     return (f"{label}0x{ack.word:04x}  ack echo 0x{ack.echo:04x} "
@@ -933,34 +946,59 @@ class Client:
         self.link = link
         self.toggle = 0
 
-    def hello(self):
-        """HELLO after the silence that ends any earlier session."""
-        self.link.quiet(SILENCE_S)
+    def in_session(self):
+        return bool(decode_state(self.link.state())["session"])
+
+    def hello(self, wait=True):
+        """HELLO, after silence when a session or a HELLO may be running."""
+        state = decode_state(self.link.state())
+        if wait or state["session"] or state["expected"]:
+            self.link.quiet(SILENCE_S)
         for index, word in enumerate(HELLO):
             ack = self.link.send(word)
             print(format_ack(ack, f"HELLO {index + 1}/4 "))
             if not acknowledged(ack, word):
                 return False
-        state = decode_state(self.link.acks.state)
+        state = decode_state(ack.state)
         if not state["session"] or state["version"] != PROTOCOL_VERSION:
-            print(f"no session: {format_state(self.link.acks.state)}")
+            print(f"no session: {format_state(ack.state)}")
             return False
         self.toggle = HELLO[-1] >> TOGGLE_SHIFT
         return True
 
     def message(self, data_words, label, show=True):
-        """One message, word by word. Its acknowledgements, or None."""
+        """One message, word by word. Its acknowledgements, or None.
+
+        A session found gone, before the message or in an acknowledgement,
+        is opened again and the message sent again from its start, once.
+        """
+        for attempt in range(2):
+            if not self.in_session() and not self.hello(wait=False):
+                return None
+            acks, lost = self.words(data_words, label, show)
+            if not lost:
+                return acks
+            print("the session ended: HELLO, then the message from its "
+                  "start")
+        return None
+
+    def words(self, data_words, label, show):
+        """The acknowledgements, or None, and whether the session was lost."""
         words, _ = stamp(data_words, self.toggle)
         acks = []
         for index, word in enumerate(words):
-            ack = self.link.send(word)
+            ack = self.link.send(word, in_session=True)
             if show or not acknowledged(ack, word):
                 print(format_ack(ack, f"{label} {index + 1}/{len(words)} "))
+            if ack is None:
+                return None, not self.in_session()
             if not acknowledged(ack, word):
-                return None
+                return None, False
+            if not ack.state >> 7 & 1 and word & DATA != BYE:
+                return None, True
             self.toggle = word >> TOGGLE_SHIFT
             acks.append(ack)
-        return acks
+        return acks, False
 
 
 def controller_linked(dongle):
@@ -1255,13 +1293,14 @@ class SelfTest:
 
     def step(self, word):
         """Problems with one word, empty when the dongle did as predicted."""
+        in_session = self.model.active
         predicted = self.model.word(word)
         if not predicted.accepted:
             if self.link.send_plain(word):
                 return []
             what = "a copy" if predicted.copy else "plain rumble"
             return [f"0x{word:04x}, {what}, moved the counter"]
-        ack = self.link.send(word)
+        ack = self.link.send(word, in_session)
         self.words += 1
         if ack is None:
             return [f"0x{word:04x}: no acknowledgement"]

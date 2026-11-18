@@ -494,10 +494,19 @@ acknowledged.
 **Stop-and-wait.** One word in flight. A word is acknowledged when the counter has advanced by exactly one from
 its value before the word and `ACK_ECHO` equals the word (for CHECKSUM, the counter alone). With no advance
 after 30 ms the client reads `ACK_STATE` with `EVIOCGABS` and resends the same word if the counter has still
-not moved. An advance by more than one or another echo means the dongle took a word the client did not send
-(another FF client on the node); the client then starts over. Linux 6.12 xpad keeps one pending packet that a
-newer one overwrites during a transfer, and 4.4 xpad fails a write during a transfer, so words cannot be
-pipelined.
+not moved and the session bit is set. An advance by more than one or another echo means the dongle took a word
+the client did not send (another FF client on the node); the client then starts over. Linux 6.12 xpad keeps one
+pending packet that a newer one overwrites during a transfer, and 4.4 xpad fails a write during a transfer, so
+words cannot be pipelined.
+
+**Lost session.** A session can end without the client noticing (the client stalled for 500 ms, a word was
+rejected), and from then on every word, resends included, is plain rumble at its byte values. So the client
+reads the session bit before each message and in every acknowledgement. When it is clear, other than after
+BYE, the client stops that message at once, resends nothing, sends HELLO and then the whole message again. The
+stop at the session start ends the rumble the stray words started. Before HELLO, when `ACK_STATE` shows a
+session or HELLO words still to come, the client first waits 500 ms of silence. A word that stays without an
+acknowledgement through its resends ends the client's sending: no further word goes out, and the session times
+out.
 
 **Copies.** A word can reach the dongle twice: ff-memless sends one upload and play as two packets when a timer
 tick falls between the two calls, and a resend repeats a word the dongle had already taken. In a session the

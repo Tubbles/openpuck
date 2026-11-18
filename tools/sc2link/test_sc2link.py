@@ -4,6 +4,8 @@
 Run: python3 tools/sc2link/test_sc2link.py
 """
 
+import contextlib
+import io
 import os
 import struct
 import sys
@@ -322,6 +324,93 @@ class Framing(unittest.TestCase):
         model = session_model()
         send(model, sc2.encode_mode(1))
         self.assertEqual(model.reboot, 1)
+
+
+class FakeLink:
+    """Link's interface over the Model. The session times out before the
+    words whose send index is in timeouts, and refused words are never
+    taken, as with a relay that stays full."""
+
+    def __init__(self, timeouts=(), refused=()):
+        self.model = sc2.Model()
+        self.timeouts = set(timeouts)
+        self.refused = set(refused)
+        self.sent = []
+
+    def state(self):
+        return self.model.state()
+
+    def quiet(self, seconds):
+        if seconds >= sc2.SESSION_TIMEOUT_S and self.model.active:
+            self.model.end_session()
+        self.model.hello = 0
+
+    def send(self, word, in_session=False):
+        if len(self.sent) in self.timeouts:
+            self.model.end_session()
+        refused = len(self.sent) in self.refused
+        self.sent.append(word)
+        outcome = sc2.Outcome(False) if refused else self.model.word(word)
+        if outcome.accepted:
+            return sc2.Ack(word, outcome.echo, outcome.state, 0, 0, 1)
+        # Link.send resends a session word only while the session bit is
+        # set, and each resend is a copy or refused again.
+        if not (in_session and not self.model.active):
+            self.sent += [word] * sc2.MAX_RESENDS
+        return None
+
+
+class Client(unittest.TestCase):
+    PULSE = sc2.encode_pulse(3, 1000, 1000, 3)
+
+    def run_client(self, link, *messages):
+        client = sc2.Client(link)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(client.hello())
+            return [client.message(data, "test") for data in messages]
+
+    def test_a_session_lost_mid_message_restarts_it(self):
+        # The session times out before the third pulse word, which the
+        # dongle then sees as plain rumble.
+        link = FakeLink(timeouts={6})
+        acks = self.run_client(link, self.PULSE, [sc2.CHECKSUM])
+        self.assertEqual(len(acks[0]), 4)
+        words, _ = sc2.stamp(self.PULSE, 0)
+        # Sent once, not resent while the session bit was clear.
+        self.assertEqual(link.sent[:8],
+                         list(sc2.HELLO) + words[:3] + [sc2.HELLO[0]])
+        self.assertEqual(link.sent[7:15], list(sc2.HELLO) + words)
+        self.assertEqual(acks[1][0].echo,
+                         sc2.crc16(sc2.report_pulse(3, 1000, 1000, 3)))
+
+    def test_a_session_found_gone_before_a_message(self):
+        link = FakeLink()
+        client = sc2.Client(link)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(client.hello())
+            link.quiet(sc2.SILENCE_S)
+            acks = client.message([sc2.CHECKSUM], "test")
+        self.assertIsNotNone(acks)
+        self.assertEqual(link.sent[4:], list(sc2.HELLO) + [0x8400])
+
+    def test_a_missing_acknowledgement_stops_the_message(self):
+        link = FakeLink(refused={5})
+        acks = self.run_client(link, self.PULSE)
+        self.assertIsNone(acks[0])
+        # The refused word was resent, nothing after it was sent.
+        self.assertEqual(len(link.sent), 4 + 2 + sc2.MAX_RESENDS)
+
+    def test_a_rejected_message_is_tried_twice(self):
+        link = FakeLink()
+        acks = self.run_client(link, [0x3800])
+        self.assertIsNone(acks[0])
+        self.assertEqual(link.sent.count(0xB800), 2)
+
+    def test_bye_ends_the_session_without_a_restart(self):
+        link = FakeLink()
+        acks = self.run_client(link, [sc2.BYE])
+        self.assertEqual(len(acks[0]), 1)
+        self.assertEqual(len(link.sent), 5)
 
 
 class Discovery(unittest.TestCase):
