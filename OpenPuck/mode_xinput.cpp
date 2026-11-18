@@ -254,11 +254,11 @@ class Adafruit_USBD_XInput : public Adafruit_USBD_Interface {
 
 static Adafruit_USBD_XInput g_xinput;
 
-static void xinputSend(uint8_t slot, uint32_t generation, uint16_t buttons,
+static void xinputPack(uint8_t report[XINPUT_REPORT_LEN], uint16_t buttons,
 		       uint8_t lt, uint8_t rt, int16_t lx, int16_t ly,
 		       int16_t rx, int16_t ry)
 {
-	uint8_t report[20] = { 0, 20 };
+	xiNeutral(report);
 	report[2] = buttons & 0xFF;
 	report[3] = buttons >> 8;
 	report[4] = lt;
@@ -271,10 +271,15 @@ static void xinputSend(uint8_t slot, uint32_t generation, uint16_t buttons,
 	report[11] = rx >> 8;
 	report[12] = ry & 0xFF;
 	report[13] = ry >> 8;
+}
+
+static void xinputSend(uint8_t slot, uint32_t generation,
+		       const uint8_t report[XINPUT_REPORT_LEN])
+{
 	uint32_t pm = __get_PRIMASK();
 	__disable_irq();
 	if (g_xiGeneration == generation && g_xi.bond == slot) {
-		memcpy(g_xi.latest, report, sizeof report);
+		memcpy(g_xi.latest, report, XINPUT_REPORT_LEN);
 		g_xi.txPending = true;
 	}
 	__set_PRIMASK(pm);
@@ -369,7 +374,7 @@ static uint16_t codeToXB(uint8_t c)
 	}
 }
 
-static void rfXboxGamepad(uint8_t slot, uint32_t generation, const uint8_t *r)
+void xinputBuildReport(const uint8_t *r, uint8_t report[XINPUT_REPORT_LEN])
 {
 	uint32_t b = btnsOf(r);
 	if (g_qamMap && (b & TB_QAM)) {
@@ -439,7 +444,14 @@ static void rfXboxGamepad(uint8_t slot, uint32_t generation, const uint8_t *r)
 	padStickBlend(b, (int16_t)s16off(r, 16), (int16_t)s16off(r, 18),
 		      (int16_t)s16off(r, 22), (int16_t)s16off(r, 24), &lx, &ly,
 		      &rx, &ry);
-	xinputSend(slot, generation, btn, lt, rt, lx, ly, rx, ry);
+	xinputPack(report, btn, lt, rt, lx, ly, rx, ry);
+}
+
+static void rfXboxGamepad(uint8_t slot, uint32_t generation, const uint8_t *r)
+{
+	uint8_t report[XINPUT_REPORT_LEN];
+	xinputBuildReport(r, report);
+	xinputSend(slot, generation, report);
 }
 
 static bool xiBondAlive(int slot, unsigned long now)

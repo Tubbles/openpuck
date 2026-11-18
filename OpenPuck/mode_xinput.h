@@ -3,6 +3,12 @@
 #include "controllers.h"
 #include <stdint.h>
 
+#define XINPUT_REPORT_LEN 20
+
+// The Xbox 360 input report for a 0x45/0x42 state, under the active type's
+// button config.
+void xinputBuildReport(const uint8_t *rep, uint8_t report[XINPUT_REPORT_LEN]);
+
 class XboxController : public IController {
     public:
 	void begin() override;
