@@ -535,10 +535,11 @@ PLAIN ────────────────────────�
   relayed. A HELLO inside a session is a copy or a rejected word, depending on the toggle.
 - 500 ms without a word ends a session; an idle client sends NOP every 200 ms. A restarting client waits 500 ms
   of silence before its HELLO, which also clears a parser left mid-message. Ending drops a partial message.
-- Starting and ending a session stop every haptic on both sides, so stray words that were plain rumble and
-  effects a vanished client left running end there: the `0x80` zero as a stop burst, then `82 03 00 00` (OFF,
-  `HAPTIC_TYPE_OFF` in SDL's `controller_structs.h`, on both sides) three times, since the relay is not
-  acknowledged. Unverified on a controller: that OFF ends a running pulse train, tone, sweep or script.
+- Starting and ending a session send the `0x80` zero as a stop burst, which ends rumble, stray plain rumble
+  included, then `82 03 00 00` (OFF, `HAPTIC_TYPE_OFF` in SDL's `controller_structs.h`) three times, since the
+  relay is not acknowledged. That OFF was meant for both pads, but side 3 of `0x82` is the left internal
+  actuator (sides below), and on a controller it did not end a running pulse train on a pad. A pulse train,
+  tone, sweep or script a client starts can outlive its session.
 - While the last RUMBLE is non-zero the dongle resends its `0x80` every 40 ms, as SDL does: the controller
   stops a rumble that is not refreshed within about 50 ms.
 - The last word of a message that queues a report is accepted only while the controller's relay ring has room
@@ -549,7 +550,15 @@ PLAIN ────────────────────────�
 are the opcode. Unused bits are zero. Payload words follow the header. A 16-bit field travels as its bits
 14..0 in its own payload word and its bit 15 (`hi`) in the header or a last payload word. Inside a message
 every word is payload: a single-word message cannot interrupt a longer one and waits until it is complete.
-`side`: 0 none, 1 left, 2 right, 3 both. Gains are s8 dB. Report fields are little-endian.
+Gains are s8 dB. Report fields are little-endian. `side` names actuators differently per report:
+
+- `0x81`: 0 right pad, 1 left pad, 2 both pads (Linux `drivers/hid/hid-steam.c`: "Left and right are swapped on
+  this report for legacy reasons").
+- `0x82` to `0x85`: 0 left pad, 1 right pad, 2 both pads, 3 left internal actuator, 4 right internal actuator,
+  5 both internal actuators. Reverse engineered, not from Valve: mwdmwd/sc26re reconstructs the stock firmware,
+  and reads sides 3 to 5 of `0x81` the same way.
+- The two side bits reach 0 to 3, so no side is silent. SDL's `0x01 = L, 0x02 = R, 0x03 = Both` belongs to the
+  feature command `MsgTriggerHaptic`, not to these reports.
 
 | Op | Name | Header bits | Payload words | Words | Report sent |
 |---|---|---|---|---|---|
@@ -564,8 +573,8 @@ every word is payload: a single-word message cannot interrupt a longer one and w
 
 COMMAND takes bit 14 alone so that its 13 bits fit one word. SWEEP needs a fifth word: its 58 bits do not fit a
 header and three payload words. RUMBLE builds `0x80` as Xbox mode does: type 4, or 0 with both speeds zero;
-intensity the larger speed; both gains 0. Example: a click on both pads at −10 dB is COMMAND data `0x4BF6`,
-report `82 03 02 F6`.
+intensity the larger speed; both gains 0. Example: a click on both pads at −10 dB is COMMAND data `0x4AF6`,
+report `82 02 02 F6`.
 
 | CONTROL sub | Name | Argument | Payload | Effect |
 |---|---|---|---|---|
@@ -582,7 +591,7 @@ later. A build with `OPK_SC2LINK_FORCE` boots into SC2 Link whatever mode was st
 CHECKSUM is a test aid. Its acknowledgement advances the counter as usual, but `ACK_ECHO` holds the
 CRC-16/CCITT-FALSE (polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR; Python's
 `binascii.crc_hqx(data, 0xFFFF)`) of the report the last report-building message queued for the controller,
-report id included: `82 03 02 F6` for the example above. A session end counts with its OFF report, `82 03 00
+report id included: `82 02 02 F6` for the example above. A session end counts with its OFF report, `82 03 00
 00`, so a new session's CHECKSUM shows whether the last one's stop was queued; the stop at a session's start and
 RUMBLE resends leave it alone. It is `0xFFFF` (the CRC of nothing) when that report was not queued, for
 instance with no controller linked. A host compares it with the CRC of the report it expects.
