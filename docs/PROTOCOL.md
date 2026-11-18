@@ -485,7 +485,7 @@ answers on the pads node:
 | 15..8 | accepted words, mod 256 |
 | 7 | session active |
 | 6..4 | payload words the parser still expects; outside a session, HELLO words still to come |
-| 3..0 | protocol version, `1` |
+| 3..0 | protocol version, `1`, read from an acknowledgement: before the first word the node can still show 0 |
 
 Each accepted word sends a pads report. The counter changes with every one, so each acceptance is a new evdev
 frame even when `ACK_ECHO` repeats; the other pads reports carry the same values. Plain rumble is never

@@ -1203,8 +1203,9 @@ void SC2LinkController::begin()
 	sc2BeginNode(g_sc2Pads, SC2_PADS_DESC, sizeof SC2_PADS_DESC);
 	sc2BeginNode(g_sc2Motion, SC2_MOTION_DESC, sizeof SC2_MOTION_DESC);
 	usbTxRegisterDrain(sc2XboxDrain);
-	// The protocol version reads 1 from the first frame, with or without a
-	// controller.
+	// Meant to show protocol version 1 before any word, but on hardware the
+	// host still read 0 until the first acknowledgement: a client checks the
+	// version on an acknowledgement.
 	sc2SendPads();
 }
 
