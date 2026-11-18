@@ -560,6 +560,10 @@ report id included: `82 03 02 F6` for the example above. It is `0xFFFF` (the CRC
 message's report was not queued, for instance with no controller linked. RUMBLE resends and session-end stops
 are not messages and leave it alone. A host compares it with the CRC of the report it expects.
 
+`tools/sc2link/sc2link_test.py` speaks this protocol from a Linux host: decoded nodes, single messages,
+a selftest of every message and rule, and the reboot commands (`--help`). `test_sc2link.py` beside it checks
+its encoder and parser model without a dongle.
+
 ## 10. WebUSB control channel
 
 The WebUSB vendor interface is absent in Xbox 360 and clean PlayStation modes.
