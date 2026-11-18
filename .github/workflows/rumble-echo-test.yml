@@ -1,0 +1,49 @@
+name: Rumble echo test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - rumble-echo-test
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            package: gcc-aarch64-linux-gnu
+            compiler: aarch64-linux-gnu-gcc
+          - arch: armhf
+            package: gcc-arm-linux-gnueabihf
+            compiler: arm-linux-gnueabihf-gcc
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.package }}
+
+      - name: Compile
+        # -Werror so a warning fails the job instead of hiding in the log.
+        run: |
+          mkdir -p build
+          ${{ matrix.compiler }} -static -O2 -Wall -Wextra -Werror \
+            -o build/rumble_echo_test-${{ matrix.arch }} \
+            tools/rumble-echo-test/rumble_echo_test.c
+          file build/rumble_echo_test-${{ matrix.arch }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: rumble_echo_test-${{ matrix.arch }}
+          retention-days: 7
+          if-no-files-found: error
+          path: build/rumble_echo_test-${{ matrix.arch }}
