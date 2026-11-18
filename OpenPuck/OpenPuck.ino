@@ -151,6 +151,9 @@ void setup()
 	factoryResetOnce(OPK_GIT_HASH);
 #endif
 	loadCfg();
+	// Rumble echo test build: Xbox 360 on every boot, whatever cfg.bin says.
+	g_usbMode = MODE_XBOX;
+	applyActiveType();
 	rfApplyStartupLastGoodChannel();
 	loadBonds();
 	// Lizard (desktop) keyboard/mouse binding table. Custom remapping applies ONLY in pure

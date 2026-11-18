@@ -65,6 +65,58 @@ static void xiNeutral(uint8_t *report)
 	report[1] = 20;
 }
 
+// Rumble echo test build: every rumble OUT packet is answered by one input
+// report carrying LT = strong byte, RT = weak byte and a 10-bit count of rumble
+// packets since boot on ECHO_BUTTON (bit 0 first). Triggers and buttons because
+// Linux xpad reports them unfiltered; its stick axes have fuzz 16 and flat 128.
+#define ECHO_RING_N 32
+
+struct Echo {
+	uint8_t strong, weak;
+	uint16_t count;
+};
+
+static struct {
+	Echo ring[ECHO_RING_N];
+	volatile uint8_t head, tail;
+	uint16_t count;
+	Echo last;
+} g_echo;
+
+// As Linux xpad reports them: BTN_A, BTN_B, BTN_X, BTN_Y, BTN_TL, BTN_TR,
+// BTN_SELECT, BTN_START, BTN_THUMBL, BTN_THUMBR.
+static const uint16_t ECHO_BUTTON[10] = { XB_A,	 XB_B,	XB_X,	 XB_Y,
+					  XB_LB, XB_RB, XB_BACK, XB_START,
+					  XB_L3, XB_R3 };
+
+static void echoReport(uint8_t *report, const Echo &echo)
+{
+	uint16_t buttons = 0;
+	for (int bit = 0; bit < 10; bit++)
+		if (echo.count & (1u << bit))
+			buttons |= ECHO_BUTTON[bit];
+	xiNeutral(report);
+	report[2] = buttons & 0xFF;
+	report[3] = buttons >> 8;
+	report[4] = echo.strong;
+	report[5] = echo.weak;
+}
+
+// A full ring drops the oldest echo, which the host sees as the counter
+// advancing by more than one.
+static void echoPush(uint8_t strong, uint8_t weak)
+{
+	uint32_t pm = __get_PRIMASK();
+	__disable_irq();
+	g_echo.count = (g_echo.count + 1) & 0x3FF;
+	uint8_t head = g_echo.head, next = (head + 1) % ECHO_RING_N;
+	if (next == g_echo.tail)
+		g_echo.tail = (g_echo.tail + 1) % ECHO_RING_N;
+	g_echo.ring[head] = { strong, weak, g_echo.count };
+	g_echo.head = next;
+	__set_PRIMASK(pm);
+}
+
 // Only used before attach or after TinyUSB has cancelled endpoint DMA.
 static void xiClear(void)
 {
@@ -194,6 +246,7 @@ static bool xi_xfer(uint8_t rhport, uint8_t ep, xfer_result_t result,
 			g_xi.rumbleMs = millis();
 			g_xi.rumbleBond = g_xi.bond;
 			g_xi.rumblePending = true;
+			echoPush(data[3], data[4]);
 		} else if (length == 3 && data[0] == 1 && data[1] == 3) {
 			// 2..5 blink then settle; 6..9 immediately select a player.
 			uint8_t led = data[2];
@@ -298,7 +351,7 @@ static void xiTxDrain(void)
 		}
 	}
 	if (generation != g_xiGeneration || !g_xi.inUse ||
-	    (!g_xi.txPending && !g_xi.neutralPending) ||
+	    (g_echo.head == g_echo.tail && !g_xi.neutralPending) ||
 	    usbd_edpt_busy(rhport, 0x81) || !usbd_edpt_claim(rhport, 0x81))
 		return;
 	uint32_t pm = __get_PRIMASK();
@@ -308,24 +361,21 @@ static void xiTxDrain(void)
 		usbd_edpt_release(rhport, 0x81);
 		return;
 	}
-	bool neutral = g_xi.neutralPending;
-	if (neutral) {
-		xiNeutral(g_xi.inBuf);
+	// A neutral (mount, failed IN transfer) repeats the last echo so the
+	// counter never steps back.
+	if (g_xi.neutralPending) {
 		g_xi.neutralPending = false;
 	} else {
-		memcpy(g_xi.inBuf, g_xi.latest, sizeof g_xi.latest);
-		g_xi.txPending = false;
+		g_echo.last = g_echo.ring[g_echo.tail];
+		g_echo.tail = (g_echo.tail + 1) % ECHO_RING_N;
 	}
+	echoReport(g_xi.inBuf, g_echo.last);
 	__set_PRIMASK(pm);
 	if (!usbd_edpt_xfer(rhport, 0x81, g_xi.inBuf, 20)) {
 		pm = __get_PRIMASK();
 		__disable_irq();
-		if (generation == g_xiGeneration) {
-			if (neutral)
-				g_xi.neutralPending = true;
-			else
-				g_xi.txPending = true;
-		}
+		if (generation == g_xiGeneration)
+			g_xi.neutralPending = true;
 		__set_PRIMASK(pm);
 		usbd_edpt_release(rhport, 0x81);
 	}
