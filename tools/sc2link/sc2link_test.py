@@ -140,13 +140,20 @@ MAX_RESENDS = 10
 IDLE_NOP_S = 0.2
 MODE_MAX = 13
 
+# In a session bit 15 of a word is a toggle that flips with each new word,
+# bits 14 to 0 are the data. The words below are data.
+TOGGLE_SHIFT = 15
+DATA = 0x7FFF
+# A header with data bit 14 set is a COMMAND, otherwise bits 13 to 11 hold the
+# opcode.
+COMMAND_BIT = 0x4000
 OP_CONTROL = 0
-OP_COMMAND = 1
-OP_SCRIPT = 2
-OP_RUMBLE = 3
-OP_PULSE = 4
-OP_SWEEP = 5
-OP_TONE = 6
+OP_SCRIPT = 1
+OP_RUMBLE = 2
+OP_PULSE = 3
+OP_SWEEP = 4
+OP_TONE = 5
+OP_COMMAND = 8
 
 CONTROL_NOP = 0x00
 CONTROL_BYE = 0x02
@@ -156,6 +163,8 @@ CONTROL_MODE = 0x06
 BOOTLOADER_CONFIRM = 0x5546
 MODE_CONFIRM = 0x4D00
 
+# Fixed words outside the toggle: their toggle is 0, so the first session
+# word carries 1.
 HELLO = (0x0102, 0x0201, 0x0103, 0x0301)
 NOP = CONTROL_NOP << 8
 BYE = CONTROL_BYE << 8
@@ -166,15 +175,26 @@ KNOCK = (0x5546, 0x32B0, 0x4F4B, 0x2121)
 
 
 def header(opcode, bits=0):
-    return opcode << 13 | bits
+    if opcode == OP_COMMAND:
+        return COMMAND_BIT | bits
+    return opcode << 11 | bits
 
 
 def side_gain(side, gain):
-    return side << 11 | (gain & 0xFF)
+    return side << 8 | (gain & 0xFF)
+
+
+def high(value, at):
+    """Bit 15 of a 16-bit field, moved to bit `at` of another word."""
+    return (value >> 15) << at
+
+
+def low(value):
+    return value & DATA
 
 
 def encode_command(side, command, gain):
-    return [header(OP_COMMAND, side_gain(side, gain) | command << 8)]
+    return [header(OP_COMMAND, command << 10 | side_gain(side, gain))]
 
 
 def encode_script(side, script, gain):
@@ -182,25 +202,42 @@ def encode_script(side, script, gain):
 
 
 def encode_rumble(left, right):
-    return [header(OP_RUMBLE), left, right]
+    return [header(OP_RUMBLE, high(left, 1) | high(right, 0)), low(left),
+            low(right)]
 
 
 def encode_rumble_stop():
-    return [header(OP_RUMBLE, 1)]
+    return [header(OP_RUMBLE, 4)]
 
 
 def encode_pulse(side, on_us, off_us, repeat):
-    return [header(OP_PULSE, side << 11), on_us, off_us, repeat]
+    tops = high(on_us, 2) | high(off_us, 1) | high(repeat, 0)
+    return [header(OP_PULSE, side << 8 | tops), low(on_us), low(off_us),
+            low(repeat)]
 
 
 def encode_sweep(side, gain, duration_ms, start_hz, end_hz):
-    return [header(OP_SWEEP, side_gain(side, gain)), duration_ms, start_hz,
-            end_hz]
+    tops = high(duration_ms, 2) | high(start_hz, 1) | high(end_hz, 0)
+    return [header(OP_SWEEP, side_gain(side, gain)), low(duration_ms),
+            low(start_hz), low(end_hz), tops]
 
 
 def encode_tone(side, gain, frequency_hz, duration_ms, lfo_hz, lfo_depth):
-    return [header(OP_TONE, side_gain(side, gain)), frequency_hz, duration_ms,
-            lfo_hz, lfo_depth]
+    tops = high(frequency_hz, 10) | high(duration_ms, 9) | high(lfo_hz, 8)
+    return [header(OP_TONE, side_gain(side, gain)), low(frequency_hz),
+            low(duration_ms), low(lfo_hz), tops | lfo_depth]
+
+
+def stamp(data_words, toggle):
+    """Session words for data sent after a word with this toggle.
+
+    Returns the words and the toggle of the last one.
+    """
+    words = []
+    for data in data_words:
+        toggle ^= 1
+        words.append(toggle << TOGGLE_SHIFT | data)
+    return words, toggle
 
 
 def encode_bootloader():
@@ -336,11 +373,22 @@ def format_state(state):
             f"expected {fields['expected']} v{fields['version']}")
 
 
-def payload_words(word):
+def opcode_of(head):
+    return OP_COMMAND if head & COMMAND_BIT else head >> 11 & 7
+
+
+# Header bits that must be zero, per opcode.
+UNUSED_BITS = {OP_COMMAND: 0x2000, OP_SCRIPT: 0x0400, OP_RUMBLE: 0x07F8,
+               OP_PULSE: 0x04F8, OP_SWEEP: 0x0400, OP_TONE: 0x0400}
+PAYLOAD_WORDS = {OP_COMMAND: 0, OP_SCRIPT: 1, OP_RUMBLE: 2, OP_PULSE: 3,
+                 OP_SWEEP: 4, OP_TONE: 4}
+
+
+def payload_words(head):
     """Payload words after a header, None for a header the dongle rejects."""
-    opcode = word >> 13
+    opcode = opcode_of(head)
     if opcode == OP_CONTROL:
-        sub, argument = word >> 8 & 0x1F, word & 0xFF
+        sub, argument = head >> 8 & 7, head & 0xFF
         if sub in (CONTROL_NOP, CONTROL_BYE, CONTROL_CHECKSUM):
             return None if argument else 0
         if sub == CONTROL_BOOTLOADER:
@@ -348,24 +396,25 @@ def payload_words(word):
         if sub == CONTROL_MODE:
             return 1 if argument <= MODE_MAX else None
         return None
-    unused = {OP_COMMAND: 0, OP_SCRIPT: 0x0700, OP_RUMBLE: 0x1FFE,
-              OP_PULSE: 0x07FF, OP_SWEEP: 0x0700, OP_TONE: 0x0700}
-    if opcode not in unused or word & unused[opcode]:
+    if opcode not in UNUSED_BITS or head & UNUSED_BITS[opcode]:
         return None
-    if opcode == OP_RUMBLE:
-        return 0 if word & 1 else 2
-    return {OP_COMMAND: 0, OP_SCRIPT: 1, OP_PULSE: 3, OP_SWEEP: 3,
-            OP_TONE: 4}[opcode]
+    if opcode == OP_RUMBLE and head & 4:
+        return None if head & 3 else 0
+    return PAYLOAD_WORDS[opcode]
 
 
-def payload_valid(head, index, word):
-    opcode = head >> 13
+def payload_valid(head, index, data):
+    opcode = opcode_of(head)
     if opcode == OP_CONTROL:
-        if head >> 8 & 0x1F == CONTROL_MODE:
-            return word == MODE_CONFIRM | (head & 0xFF)
-        return word == BOOTLOADER_CONFIRM
-    if opcode == OP_SCRIPT or (opcode == OP_TONE and index == 3):
-        return word <= 0xFF
+        if head >> 8 & 7 == CONTROL_MODE:
+            return data == MODE_CONFIRM | (head & 0xFF)
+        return data == BOOTLOADER_CONFIRM
+    if opcode == OP_SCRIPT:
+        return data <= 0xFF
+    if opcode == OP_SWEEP and index == 3:
+        return data <= 7
+    if opcode == OP_TONE and index == 3:
+        return data <= 0x7FF
     return True
 
 
@@ -373,30 +422,46 @@ def signed8(value):
     return value - 0x100 if value & 0x80 else value
 
 
+def join(tops, at, low_bits):
+    """A 16-bit field: bit 15 from bit `at` of tops, the rest from low_bits."""
+    return (tops >> at & 1) << 15 | low_bits
+
+
 def build_report(head, payload):
     """The report a complete message queues, None for CONTROL."""
-    opcode = head >> 13
-    side, gain = head >> 11 & 3, signed8(head & 0xFF)
+    opcode = opcode_of(head)
+    side, gain = head >> 8 & 3, signed8(head & 0xFF)
     if opcode == OP_COMMAND:
-        return report_command(side, head >> 8 & 7, gain)
+        return report_command(side, head >> 10 & 7, gain)
     if opcode == OP_SCRIPT:
         return report_script(side, payload[0], gain)
     if opcode == OP_RUMBLE:
-        return report_rumble(*(payload or (0, 0)))
+        if head & 4:
+            return report_rumble(0, 0)
+        return report_rumble(join(head, 1, payload[0]),
+                             join(head, 0, payload[1]))
     if opcode == OP_PULSE:
-        return report_pulse(side, *payload)
+        return report_pulse(side, *(join(head, 2 - index, payload[index])
+                                    for index in range(3)))
     if opcode == OP_SWEEP:
-        return report_sweep(side, gain, *payload)
+        return report_sweep(side, gain,
+                            *(join(payload[3], 2 - index, payload[index])
+                              for index in range(3)))
     if opcode == OP_TONE:
-        return report_tone(side, gain, *payload)
+        return report_tone(side, gain,
+                           *(join(payload[3], 10 - index, payload[index])
+                             for index in range(3)),
+                           payload[3] & 0xFF)
     return None
 
 
 @dataclasses.dataclass
 class Outcome:
+    """A word taken (accepted), a copy acknowledged again, or neither."""
     accepted: bool
     echo: int = 0
     state: int = 0
+    copy: bool = False
 
 
 class Model:
@@ -414,6 +479,7 @@ class Model:
         self.head = 0
         self.payload = []
         self.need = 0
+        self.toggle = 0
         self.echo = 0
         self.queued = b""
         self.reboot = None
@@ -428,6 +494,8 @@ class Model:
         self.need = 0
 
     def word(self, word):
+        if self._copy(word):
+            return Outcome(False, self.echo, self.state(), copy=True)
         if not self.active:
             if not self._hello_step(word):
                 return Outcome(False)
@@ -435,14 +503,21 @@ class Model:
                 self.active = True
                 self.hello = 0
                 self.need = 0
+                self.toggle = HELLO[-1] >> TOGGLE_SHIFT
             return self._accept(word)
         if self.need:
             return self._payload(word)
-        need = payload_words(word)
+        need = payload_words(word & DATA)
         if need is None:
             return self._reject(word)
-        self.head, self.payload, self.need = word, [], need
+        self.head, self.payload, self.need = word & DATA, [], need
+        self.toggle = word >> TOGGLE_SHIFT
         return self._accept(self._run(word) if not need else word)
+
+    def _copy(self, word):
+        if self.active:
+            return word >> TOGGLE_SHIFT == self.toggle
+        return bool(self.hello) and word == HELLO[self.hello - 1]
 
     def _hello_step(self, word):
         if word != HELLO[self.hello]:
@@ -453,9 +528,10 @@ class Model:
         return True
 
     def _payload(self, word):
-        if not payload_valid(self.head, len(self.payload), word):
+        if not payload_valid(self.head, len(self.payload), word & DATA):
             return self._reject(word)
-        self.payload.append(word)
+        self.payload.append(word & DATA)
+        self.toggle = word >> TOGGLE_SHIFT
         self.need -= 1
         return self._accept(self._run(word) if not self.need else word)
 
@@ -465,7 +541,7 @@ class Model:
         return self._accept(word)
 
     def _run(self, last):
-        opcode, sub = self.head >> 13, self.head >> 8 & 0x1F
+        opcode, sub = opcode_of(self.head), self.head >> 8 & 7
         report = build_report(self.head, self.payload)
         if opcode != OP_CONTROL:
             self.queued = report if self.linked else b""
@@ -834,20 +910,50 @@ def format_ack(ack, label=""):
             f"{resent}{jump}")
 
 
-def open_session(link, verbose=True):
-    """HELLO after the silence that ends any earlier session."""
-    link.quiet(SILENCE_S)
-    for index, word in enumerate(HELLO):
-        ack = link.send(word)
-        if verbose:
+def acknowledged(ack, word):
+    """The counter moved by exactly one and the echo is this word's.
+
+    CHECKSUM's echo is the checksum, so only its counter is checked.
+    """
+    return (ack is not None and ack.advance == 1
+            and (ack.echo == word or word & DATA == CHECKSUM))
+
+
+class Client:
+    """A session kept as docs/PROTOCOL.md tells a client to keep one."""
+
+    def __init__(self, link):
+        self.link = link
+        self.toggle = 0
+
+    def hello(self):
+        """HELLO after the silence that ends any earlier session."""
+        self.link.quiet(SILENCE_S)
+        for index, word in enumerate(HELLO):
+            ack = self.link.send(word)
             print(format_ack(ack, f"HELLO {index + 1}/4 "))
-        if ack is None:
+            if not acknowledged(ack, word):
+                return False
+        state = decode_state(self.link.acks.state)
+        if not state["session"] or state["version"] != PROTOCOL_VERSION:
+            print(f"no session: {format_state(self.link.acks.state)}")
             return False
-    state = decode_state(link.acks.state)
-    if not state["session"] or state["version"] != PROTOCOL_VERSION:
-        print(f"no session: {format_state(link.acks.state)}")
-        return False
-    return True
+        self.toggle = HELLO[-1] >> TOGGLE_SHIFT
+        return True
+
+    def message(self, data_words, label, show=True):
+        """One message, word by word. Its acknowledgements, or None."""
+        words, _ = stamp(data_words, self.toggle)
+        acks = []
+        for index, word in enumerate(words):
+            ack = self.link.send(word)
+            if show or not acknowledged(ack, word):
+                print(format_ack(ack, f"{label} {index + 1}/{len(words)} "))
+            if not acknowledged(ack, word):
+                return None
+            self.toggle = word >> TOGGLE_SHIFT
+            acks.append(ack)
+        return acks
 
 
 def controller_linked(dongle):
@@ -1011,38 +1117,38 @@ def watch(descriptors, values):
         print()
 
 
-def with_link(args, body):
+def with_client(args, body):
     link = Link(choose_dongle(args.phys))
     try:
-        return body(link)
+        return body(Client(link))
     finally:
         link.close()
 
 
 def command_hello(args):
-    def body(link):
-        if not open_session(link):
+    def body(client):
+        if not client.hello():
             return 1
         print("session open; it ends 500 ms after the last word")
         return 0
-    return with_link(args, body)
+    return with_client(args, body)
 
 
 def command_bye(args):
-    def body(link):
-        if not open_session(link):
+    def body(client):
+        if not client.hello():
             return 1
-        ack = link.send(BYE)
-        print(format_ack(ack, "BYE       "))
-        return 0 if ack and not decode_state(ack.state)["session"] else 1
-    return with_link(args, body)
+        acks = client.message([BYE], "BYE")
+        return 0 if acks and not decode_state(acks[-1].state)["session"] else 1
+    return with_client(args, body)
 
 
-def hold_session(link, seconds):
+def hold_session(client, seconds):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        link.quiet(min(IDLE_NOP_S, max(deadline - time.monotonic(), 0)))
-        if link.send(NOP) is None:
+        client.link.quiet(min(IDLE_NOP_S,
+                              max(deadline - time.monotonic(), 0)))
+        if client.message([NOP], "NOP", show=False) is None:
             return False
     return True
 
@@ -1059,48 +1165,43 @@ def command_send(args):
         words = message.encode(*values)
     expected = message.report(*values)
 
-    def body(link):
-        if not open_session(link):
+    def body(client):
+        # A missing acknowledgement ends the command: the rest would be
+        # rumble. The session then times out and the dongle stops.
+        if not client.hello() or client.message(words, message.name) is None:
             return 1
-        failed = False
-        for index, word in enumerate(words):
-            ack = link.send(word)
-            print(format_ack(ack, f"word {index + 1}/{len(words)}  "))
-            failed |= ack is None or ack.echo != word
-        ack = link.send(CHECKSUM)
-        print(format_ack(ack, "CHECKSUM  "))
+        acks = client.message([CHECKSUM], "CHECKSUM")
+        if acks is None:
+            return 1
+        checksum = acks[-1].echo
         report = " ".join(f"{byte:02x}" for byte in expected)
-        print(f"report {report}  crc 0x{crc16(expected):04x}", end="")
-        if ack is not None:
-            match = "match" if ack.echo == crc16(expected) else "MISMATCH"
-            print(f"  dongle 0x{ack.echo:04x} {match}", end="")
-            failed |= ack.echo != crc16(expected)
-        print()
-        if args.hold:
-            hold_session(link, args.hold)
-        print(format_ack(link.send(BYE), "BYE       "))
-        return 1 if failed or ack is None else 0
-    return with_link(args, body)
+        match = "match" if checksum == crc16(expected) else "MISMATCH"
+        print(f"report {report}  crc 0x{crc16(expected):04x}  dongle "
+              f"0x{checksum:04x} {match}")
+        if args.hold and not hold_session(client, args.hold):
+            return 1
+        if client.message([BYE], "BYE") is None:
+            return 1
+        return 0 if checksum == crc16(expected) else 1
+    return with_client(args, body)
 
 
 def reboot_command(args, words, what):
-    def body(link):
-        if not open_session(link):
+    def body(client):
+        if not client.hello():
             return 1
-        for word in words:
-            ack = link.send(word)
-            print(format_ack(ack, f"{what:10s}"))
-            if ack is None:
-                return 1
-            if not decode_state(ack.state)["session"]:
-                print("rejected: the session ended")
-                return 1
-        if link.gone(3.0):
+        acks = client.message(words, what)
+        if acks is None:
+            return 1
+        if not decode_state(acks[-1].state)["session"]:
+            print("rejected: the session ended")
+            return 1
+        if client.link.gone(3.0):
             print(f"the dongle left the bus: rebooting into {what}")
             return 0
         print("the dongle is still there after 3 s")
         return 1
-    return with_link(args, body)
+    return with_client(args, body)
 
 
 def command_bootloader(args):
@@ -1115,7 +1216,8 @@ def command_mode(args):
 
 
 def command_knock(args):
-    def body(link):
+    def body(client):
+        link = client.link
         link.quiet(SILENCE_S)
         for word in KNOCK:
             link.write_word(word)
@@ -1126,7 +1228,7 @@ def command_knock(args):
             return 0
         print("the dongle is still there after 3 s")
         return 1
-    return with_link(args, body)
+    return with_client(args, body)
 
 
 class SelfTest:
@@ -1137,6 +1239,12 @@ class SelfTest:
         self.model = Model(link.acks.counter(), linked)
         self.results = []
         self.words = 0
+        # The client's toggle, which the cases follow or break on purpose.
+        self.toggle = 0
+
+    def stamp(self, data_words):
+        words, self.toggle = stamp(data_words, self.toggle)
+        return words
 
     def step(self, word):
         """Problems with one word, empty when the dongle did as predicted."""
@@ -1144,7 +1252,8 @@ class SelfTest:
         if not predicted.accepted:
             if self.link.send_plain(word):
                 return []
-            return [f"0x{word:04x} outside a session was acknowledged"]
+            what = "a copy" if predicted.copy else "plain rumble"
+            return [f"0x{word:04x}, {what}, moved the counter"]
         ack = self.link.send(word)
         self.words += 1
         if ack is None:
@@ -1155,7 +1264,7 @@ class SelfTest:
         if ack.echo != predicted.echo:
             problems.append(f"0x{word:04x}: echo 0x{ack.echo:04x}, expected "
                             f"0x{predicted.echo:04x}")
-            if word == CHECKSUM:
+            if word & DATA == CHECKSUM:
                 problems.append("expected report: " + (
                     self.model.queued.hex(" ") or "none queued"))
         if ack.state != predicted.state:
@@ -1175,6 +1284,7 @@ class SelfTest:
             if self.link.send(word) is None:
                 raise SystemExit("result: FAIL, no session after a failed "
                                  "case")
+        self.toggle = self.model.toggle
 
     def case(self, name, words, quiet=False):
         problems = []
@@ -1193,8 +1303,10 @@ class SelfTest:
             print(f"{'FAIL' if problems else 'PASS'} {name}"
                   + "".join(f"\n     {problem}" for problem in problems))
 
-    def hello(self, name="HELLO opens a session"):
-        return self.case(name, HELLO)
+    def hello(self, name="HELLO opens a session", words=HELLO):
+        passed = self.case(name, words)
+        self.toggle = HELLO[-1] >> TOGGLE_SHIFT
+        return passed
 
 
 def selftest_plain(test):
@@ -1219,14 +1331,14 @@ def selftest_messages(test):
         failed = 0
         cases = boundary_cases(message)
         for values in cases:
-            words = message.encode(*values) + [CHECKSUM]
+            words = test.stamp(message.encode(*values) + [CHECKSUM])
             if not test.case(describe_case(message, values), words,
                              quiet=True):
                 failed += 1
         if message.name == "rumble":
-            failed += not test.case("rumble stop",
-                                    encode_rumble_stop() + [CHECKSUM],
-                                    quiet=True)
+            failed += not test.case(
+                "rumble stop", test.stamp(encode_rumble_stop() + [CHECKSUM]),
+                quiet=True)
         if not failed:
             print(f"PASS {message.name}: {len(cases)} messages, every field "
                   "at minimum, middle and maximum")
@@ -1234,26 +1346,51 @@ def selftest_messages(test):
     return (test.words - words_before) / elapsed if elapsed else 0.0
 
 
+def doubled(words):
+    return [word for word in words for _ in range(2)]
+
+
+def silent_maximum(field):
+    """Wide fields at their maximum, side none and gain at -128 dB."""
+    return {SIDE: SIDE.minimum, GAIN: GAIN.minimum}.get(field, field.maximum)
+
+
+def selftest_copies(test):
+    """Every word twice: each copy is acknowledged again, not taken."""
+    for message in MESSAGES.values():
+        values = tuple(map(silent_maximum, message.fields))
+        data_words = message.encode(*values) + [CHECKSUM]
+        if message.name == "rumble":
+            data_words += encode_rumble_stop()
+        test.case(f"{message.name} with every word sent twice",
+                  doubled(test.stamp(data_words)))
+    test.link.quiet(SILENCE_S)
+    test.link.acks.refresh()
+    test.model.end_session()
+    test.model.counter = test.link.acks.counter()
+    test.hello("HELLO with every word sent twice", doubled(HELLO))
+
+
 def selftest_framing(test):
     rejected = (
-        ("opcode 7 ends the session", [0xE000]),
-        ("a non-zero unused header bit ends the session", [0x8001]),
-        ("an undefined CONTROL sub ends the session", [0x1F00]),
+        ("reserved opcode 7 ends the session", [header(7)]),
+        ("a non-zero unused header bit ends the session",
+         [header(OP_PULSE, 8)]),
+        ("an undefined CONTROL sub ends the session", [0x0700]),
         ("a non-zero unused payload bit ends the session",
          [header(OP_SCRIPT), 0x0100]),
     )
-    for name, words in rejected:
-        test.case(name, words)
+    for name, data_words in rejected:
+        test.case(name, test.stamp(data_words))
         test.hello("HELLO after it opens a new session")
-    test.case("a HELLO at a message boundary restarts the session", HELLO)
     # A click sent after a PULSE header is the pulse's on time.
     click = encode_command(3, 2, -10)[0]
     test.case("a one-word message inside a longer one is payload",
-              encode_pulse(3, click, 0, 1) + [CHECKSUM])
+              test.stamp(encode_pulse(3, click, 0, 1) + [CHECKSUM]))
 
 
 def selftest_truncated(test):
-    tone = encode_tone(0, -128, 1000, 10, 0, 0)
+    tone = test.stamp(encode_tone(0, -128, 1000, 10, 0, 0))
     if not test.case("a truncated message waits for its payload", tone[:3]):
         return
     test.link.quiet(SILENCE_S)
@@ -1268,7 +1405,7 @@ def selftest_truncated(test):
     test.model.end_session()
     test.model.counter = state >> 8
     test.hello("HELLO after the timeout opens a new session")
-    test.case("the dropped message queued no report", [CHECKSUM])
+    test.case("the dropped message queued no report", test.stamp([CHECKSUM]))
 
 
 def percentile(sorted_values, fraction):
@@ -1285,17 +1422,20 @@ def command_selftest(args):
         print("no controller linked: the dongle drops every report, so each "
               "CHECKSUM must read 0xffff")
 
-    def body(link):
+    def body(client):
+        link = client.link
         test = SelfTest(link, linked)
         selftest_plain(test)
         if not test.hello():
             print("result: FAIL, no session")
             return 1
         rate = selftest_messages(test)
+        selftest_copies(test)
         selftest_framing(test)
         selftest_truncated(test)
         test.case("clean up: haptics off on both sides, rumble stop, BYE",
-                  encode_command(3, 0, 0) + encode_rumble_stop() + [BYE])
+                  test.stamp(encode_command(3, 0, 0) + encode_rumble_stop()
+                             + [BYE]))
         failed = sum(1 for _, problems in test.results if problems)
         times = sorted(link.round_trips_ns)
         print(f"words acknowledged: {len(times)}, resends: {link.resends}")
@@ -1311,7 +1451,7 @@ def command_selftest(args):
             return 1
         print(f"result: PASS, {len(test.results)} cases")
         return 0
-    return with_link(args, body)
+    return with_client(args, body)
 
 
 def build_parser():

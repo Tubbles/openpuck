@@ -38,7 +38,11 @@ SC2LinkController g_sc2LinkCtl;
 #define SC2_PADS_ACK_AT 14
 #define SC2_MOTION_LEN 12
 
-// The word protocol. A word is one rumble packet, strong byte high.
+// The word protocol. A word is one rumble packet, strong byte high. In a
+// session bit 15 is a toggle that flips with each new word, so a copy of the
+// last word is told from the next, and bits 14 to 0 are the data.
+#define SC2_TOGGLE_SHIFT 15
+#define SC2_DATA 0x7FFF
 #define SC2_PROTOCOL_VERSION 1
 #define SC2_SESSION_MS 500u
 // SDL refreshes a running rumble this often: the controller stops one that
@@ -50,17 +54,20 @@ SC2LinkController g_sc2LinkCtl;
 // A controller report with its id, the longest being 0x80 and 0x83.
 #define SC2_REPORT_MAX 10
 
-// Header bits 15 to 13.
+// A header with data bit 14 set is a COMMAND, whose 13 bits leave no room for
+// a 3-bit opcode in one word. Otherwise the opcode is in bits 13 to 11.
+#define SC2_COMMAND_BIT 0x4000
 enum Sc2Op {
 	SC2_OP_CONTROL,
-	SC2_OP_COMMAND,
 	SC2_OP_SCRIPT,
 	SC2_OP_RUMBLE,
 	SC2_OP_PULSE,
 	SC2_OP_SWEEP,
 	SC2_OP_TONE,
+	// 6 and 7 are reserved.
+	SC2_OP_COMMAND = 8,
 };
-// CONTROL subs, header bits 12 to 8.
+// CONTROL subs, header bits 10 to 8.
 #define SC2_CTL_NOP 0x00
 #define SC2_CTL_BYE 0x02
 // A test aid: its ACK_ECHO is the CRC of the last queued report.
@@ -73,8 +80,8 @@ enum Sc2Op {
 // ORed with the mode number from the header.
 #define SC2_MODE_CONFIRM 0x4D00
 
-// Each is an undefined CONTROL header, so no message starts with one, and a
-// HELLO sent inside a session at a message boundary restarts the session.
+// Each is an undefined CONTROL header, so no message starts with one. Their
+// toggle is 0, so the first word of a session carries 1.
 static const uint16_t SC2_HELLO[] = { 0x0102, 0x0201, 0x0103, 0x0301 };
 static const uint8_t SC2_HELLO_WORDS = sizeof SC2_HELLO / sizeof SC2_HELLO[0];
 
@@ -289,10 +296,13 @@ struct Sc2Session {
 	uint8_t hello;
 	unsigned long helloMs;
 	unsigned long wordMs;
-	// The message being received, and how many payload words are to come.
+	// The message being received, data bits only, and how many payload
+	// words are to come.
 	uint16_t header;
 	uint16_t payload[SC2_MAX_PAYLOAD];
 	uint8_t have, need;
+	// The toggle of the last word taken in the session.
+	uint8_t toggle;
 	// ACK_STATE's counter of accepted words, and ACK_ECHO.
 	uint8_t counter;
 	uint16_t echo;
@@ -687,12 +697,14 @@ static void sc2RelayRumble(void)
 
 static uint8_t sc2Op(uint16_t header)
 {
-	return (uint8_t)(header >> 13);
+	if (header & SC2_COMMAND_BIT)
+		return SC2_OP_COMMAND;
+	return (uint8_t)((header >> 11) & 7);
 }
 
 static uint8_t sc2ControlSub(uint16_t header)
 {
-	return (uint8_t)((header >> 8) & 0x1F);
+	return (uint8_t)((header >> 8) & 7);
 }
 
 static int8_t sc2ControlWords(uint16_t header)
@@ -714,27 +726,29 @@ static int8_t sc2ControlWords(uint16_t header)
 }
 
 // The payload words that follow a header, or -1 for a header the parser
-// rejects: opcode 7, an undefined CONTROL sub or a non-zero unused bit.
+// rejects: a reserved opcode, an undefined CONTROL sub or a non-zero unused
+// bit.
 static int8_t sc2PayloadWords(uint16_t header)
 {
 	switch (sc2Op(header)) {
 	case SC2_OP_CONTROL:
 		return sc2ControlWords(header);
 	case SC2_OP_COMMAND:
-		return 0;
+		return (header & 0x2000) ? -1 : 0;
 	case SC2_OP_SCRIPT:
-		return (header & 0x0700) ? -1 : 1;
+		return (header & 0x0400) ? -1 : 1;
 	case SC2_OP_RUMBLE:
-		// Bit 0 is a stop: both speeds zero, no payload.
-		if (header & 0x1FFE)
+		if (header & 0x07F8)
 			return -1;
-		return (header & 1) ? 0 : 2;
+		// Bit 2 is a stop: both speeds zero, no payload.
+		if (header & 4)
+			return (header & 3) ? -1 : 0;
+		return 2;
 	case SC2_OP_PULSE:
-		return (header & 0x07FF) ? -1 : 3;
+		return (header & 0x04F8) ? -1 : 3;
 	case SC2_OP_SWEEP:
-		return (header & 0x0700) ? -1 : 3;
 	case SC2_OP_TONE:
-		return (header & 0x0700) ? -1 : 4;
+		return (header & 0x0400) ? -1 : 4;
 	default:
 		return -1;
 	}
@@ -743,20 +757,29 @@ static int8_t sc2PayloadWords(uint16_t header)
 // A payload field narrower than its word keeps the unused bits zero, like a
 // header, so a word taken out of step is more likely to be caught. A command
 // that reboots takes only its confirmation word.
-static bool sc2PayloadValid(uint16_t header, uint8_t index, uint16_t word)
+static bool sc2PayloadValid(uint16_t header, uint8_t index, uint16_t data)
 {
 	switch (sc2Op(header)) {
 	case SC2_OP_CONTROL:
 		if (sc2ControlSub(header) == SC2_CTL_MODE)
-			return word == (SC2_MODE_CONFIRM | (header & 0xFF));
-		return word == SC2_BOOT_CONFIRM;
+			return data == (SC2_MODE_CONFIRM | (header & 0xFF));
+		return data == SC2_BOOT_CONFIRM;
 	case SC2_OP_SCRIPT:
-		return word <= 0xFF;
+		return data <= 0xFF;
+	case SC2_OP_SWEEP:
+		return index != 3 || data <= 7;
 	case SC2_OP_TONE:
-		return index != 3 || word <= 0xFF;
+		return index != 3 || data <= 0x7FF;
 	default:
 		return true;
 	}
+}
+
+// A 16-bit field from 15-bit words: bit 15 is bit `at` of `high`, the rest is
+// `low`.
+static uint16_t sc2Join(uint16_t high, uint8_t at, uint16_t low)
+{
+	return (uint16_t)(((high >> at) & 1) << 15 | low);
 }
 
 // The controller report for a complete message, report id first, in the
@@ -764,13 +787,13 @@ static bool sc2PayloadValid(uint16_t header, uint8_t index, uint16_t word)
 static uint8_t sc2BuildReport(uint16_t header, const uint16_t *payload,
 			      uint8_t out[SC2_REPORT_MAX])
 {
-	uint8_t side = (uint8_t)((header >> 11) & 3);
+	uint8_t side = (uint8_t)((header >> 8) & 3);
 	uint8_t gain = (uint8_t)(header & 0xFF);
 	switch (sc2Op(header)) {
 	case SC2_OP_COMMAND:
 		out[0] = 0x82;
 		out[1] = side;
-		out[2] = (uint8_t)((header >> 8) & 7);
+		out[2] = (uint8_t)((header >> 10) & 7);
 		out[3] = gain;
 		return 4;
 	case SC2_OP_SCRIPT:
@@ -781,30 +804,38 @@ static uint8_t sc2BuildReport(uint16_t header, const uint16_t *payload,
 		return 4;
 	case SC2_OP_RUMBLE:
 		out[0] = 0x80;
-		if (header & 1)
+		if (header & 4)
 			hapticRumbleReport(0, 0, out + 1);
 		else
-			hapticRumbleReport(payload[0], payload[1], out + 1);
+			hapticRumbleReport(sc2Join(header, 1, payload[0]),
+					   sc2Join(header, 0, payload[1]),
+					   out + 1);
 		return 1 + HAPTIC_RUMBLE_LEN;
 	case SC2_OP_PULSE:
 		out[0] = 0x81;
 		out[1] = side;
 		for (uint8_t i = 0; i < 3; i++)
-			le16(out + 2 + 2 * i, (int16_t)payload[i]);
+			le16(out + 2 + 2 * i,
+			     (int16_t)sc2Join(header, (uint8_t)(2 - i),
+					      payload[i]));
 		return 8;
 	case SC2_OP_SWEEP:
 		out[0] = 0x84;
 		out[1] = side;
 		out[2] = gain;
 		for (uint8_t i = 0; i < 3; i++)
-			le16(out + 3 + 2 * i, (int16_t)payload[i]);
+			le16(out + 3 + 2 * i,
+			     (int16_t)sc2Join(payload[3], (uint8_t)(2 - i),
+					      payload[i]));
 		return 9;
 	case SC2_OP_TONE:
 		out[0] = 0x83;
 		out[1] = side;
 		out[2] = gain;
 		for (uint8_t i = 0; i < 3; i++)
-			le16(out + 3 + 2 * i, (int16_t)payload[i]);
+			le16(out + 3 + 2 * i,
+			     (int16_t)sc2Join(payload[3], (uint8_t)(10 - i),
+					      payload[i]));
 		out[9] = (uint8_t)payload[3];
 		return 10;
 	default:
@@ -871,6 +902,8 @@ static void sc2StartSession(unsigned long ms)
 	session.active = true;
 	session.hello = 0;
 	session.need = 0;
+	session.toggle =
+		(uint8_t)(SC2_HELLO[SC2_HELLO_WORDS - 1] >> SC2_TOGGLE_SHIFT);
 	session.rumbleOn = false;
 	session.wordMs = ms;
 }
@@ -964,13 +997,15 @@ static void sc2Reject(uint16_t word, unsigned long ms)
 static void sc2PayloadWord(uint16_t word, unsigned long ms)
 {
 	Sc2Session &session = g_sc2Session;
-	if (!sc2PayloadValid(session.header, session.have, word)) {
+	uint16_t data = word & SC2_DATA;
+	if (!sc2PayloadValid(session.header, session.have, data)) {
 		sc2Reject(word, ms);
 		return;
 	}
 	if (session.need == 1 && !sc2CanComplete(session.header))
 		return;
-	session.payload[session.have++] = word;
+	session.payload[session.have++] = data;
+	session.toggle = (uint8_t)(word >> SC2_TOGGLE_SHIFT);
 	uint16_t echo = word;
 	if (!--session.need)
 		echo = sc2Run(word);
@@ -984,20 +1019,35 @@ static void sc2SessionWord(uint16_t word, unsigned long ms)
 		sc2PayloadWord(word, ms);
 		return;
 	}
-	int8_t need = sc2PayloadWords(word);
+	uint16_t header = word & SC2_DATA;
+	int8_t need = sc2PayloadWords(header);
 	if (need < 0) {
 		sc2Reject(word, ms);
 		return;
 	}
-	if (!need && !sc2CanComplete(word))
+	if (!need && !sc2CanComplete(header))
 		return;
-	session.header = word;
+	session.header = header;
 	session.have = 0;
 	session.need = (uint8_t)need;
+	session.toggle = (uint8_t)(word >> SC2_TOGGLE_SHIFT);
 	uint16_t echo = word;
 	if (!need)
 		echo = sc2Run(word);
 	sc2Accept(echo);
+}
+
+// One upload and play can reach the dongle twice when an ff-memless timer
+// tick falls between the two, and a client resends a word whose
+// acknowledgement was slow. Such a copy is not taken again: in a session it
+// carries the last toggle, outside it repeats the last HELLO word matched.
+static bool sc2Copy(uint16_t word, unsigned long ms)
+{
+	const Sc2Session &session = g_sc2Session;
+	if (session.active)
+		return (word >> SC2_TOGGLE_SHIFT) == session.toggle;
+	return session.hello && word == SC2_HELLO[session.hello - 1] &&
+	       ms - session.helloMs <= SC2_SESSION_MS;
 }
 
 static void sc2OnWord(uint16_t word, unsigned long ms)
@@ -1005,8 +1055,14 @@ static void sc2OnWord(uint16_t word, unsigned long ms)
 	Sc2Session &session = g_sc2Session;
 	if (g_sc2Reboot != SC2_REBOOT_NONE)
 		return;
-	if (session.active) {
+	if (session.active)
 		session.wordMs = ms;
+	if (sc2Copy(word, ms)) {
+		// The same acknowledgement again, in case the first was lost.
+		sc2SendPads();
+		return;
+	}
+	if (session.active) {
 		sc2SessionWord(word, ms);
 		return;
 	}

@@ -18,8 +18,14 @@ def run(model, words):
     return [model.word(word) for word in words]
 
 
-def session_model():
-    model = sc2.Model()
+def send(model, data_words):
+    """Session words with the toggles a client gives them."""
+    words, _ = sc2.stamp(data_words, model.toggle)
+    return run(model, words)
+
+
+def session_model(linked=True):
+    model = sc2.Model(linked=linked)
     run(model, sc2.HELLO)
     return model
 
@@ -47,26 +53,42 @@ class StructLayouts(unittest.TestCase):
 
 class Encoder(unittest.TestCase):
     def test_protocol_example(self):
-        # docs/PROTOCOL.md: COMMAND 0x3AF6 becomes 82 03 02 F6.
-        self.assertEqual(sc2.encode_command(3, 2, -10), [0x3AF6])
+        # docs/PROTOCOL.md: COMMAND data 0x4BF6 becomes 82 03 02 F6.
+        self.assertEqual(sc2.encode_command(3, 2, -10), [0x4BF6])
         self.assertEqual(sc2.report_command(3, 2, -10).hex(), "820302f6")
+
+    def test_layouts(self):
+        # The bit layouts of the message table in docs/PROTOCOL.md.
+        self.assertEqual(sc2.encode_script(1, 0xFF, -1), [0x09FF, 0x00FF])
+        self.assertEqual(sc2.encode_rumble(0xFFFF, 0x1234),
+                         [0x1002, 0x7FFF, 0x1234])
+        self.assertEqual(sc2.encode_pulse(3, 0xFFFF, 1, 0x8000),
+                         [0x1B05, 0x7FFF, 0x0001, 0x0000])
+        self.assertEqual(sc2.encode_sweep(1, -128, 0xFFFF, 2, 0x8003),
+                         [0x2180, 0x7FFF, 0x0002, 0x0003, 0x0005])
+        self.assertEqual(sc2.encode_tone(2, 127, 0xFFFF, 4, 0x8005, 0xFF),
+                         [0x2A7F, 0x7FFF, 0x0004, 0x0005, 0x05FF])
 
     def test_word_counts(self):
         counts = {"command": 1, "script": 2, "rumble": 3, "pulse": 4,
-                  "sweep": 4, "tone": 5}
+                  "sweep": 5, "tone": 5}
         for name, message in sc2.MESSAGES.items():
             for values in sc2.boundary_cases(message):
                 words = message.encode(*values)
                 self.assertEqual(len(words), counts[name])
-                self.assertTrue(all(0 <= word <= 0xFFFF for word in words))
+                self.assertTrue(all(0 <= word <= sc2.DATA for word in words))
                 self.assertEqual(sc2.payload_words(words[0]), len(words) - 1)
 
     def test_control_words(self):
         self.assertEqual(sc2.encode_bootloader(), [0x0500, 0x5546])
         self.assertEqual(sc2.encode_mode(13), [0x060D, 0x4D0D])
-        self.assertEqual(sc2.encode_rumble_stop(), [0x6001])
+        self.assertEqual(sc2.encode_rumble_stop(), [0x1004])
         for word in (sc2.NOP, sc2.BYE, sc2.CHECKSUM):
             self.assertEqual(sc2.payload_words(word), 0)
+
+    def test_stamp(self):
+        self.assertEqual(sc2.stamp([0x0400, 0x0400, 0x0200], 0),
+                         ([0x8400, 0x0400, 0x8200], 1))
 
     def test_report_lengths(self):
         # SDL's *_REPORT_BYTES, report id included.
@@ -124,17 +146,15 @@ class Decoder(unittest.TestCase):
 
     def test_checksum_of_queued_report(self):
         model = session_model()
-        words = sc2.encode_tone(3, -20, 160, 500, 4, 200)
-        run(model, words)
-        outcome = model.word(sc2.CHECKSUM)
+        outcomes = send(model, sc2.encode_tone(3, -20, 160, 500, 4, 200)
+                        + [sc2.CHECKSUM])
         expected = sc2.crc16(sc2.report_tone(3, -20, 160, 500, 4, 200))
-        self.assertEqual(outcome.echo, expected)
+        self.assertEqual(outcomes[-1].echo, expected)
 
     def test_checksum_without_controller(self):
-        model = sc2.Model(linked=False)
-        run(model, sc2.HELLO)
-        run(model, sc2.encode_rumble(1, 2))
-        self.assertEqual(model.word(sc2.CHECKSUM).echo, 0xFFFF)
+        model = session_model(linked=False)
+        outcomes = send(model, sc2.encode_rumble(1, 2) + [sc2.CHECKSUM])
+        self.assertEqual(outcomes[-1].echo, 0xFFFF)
 
     def test_crc_check_value(self):
         self.assertEqual(sc2.crc16(b"123456789"), 0x29B1)
@@ -175,72 +195,117 @@ class State(unittest.TestCase):
 
     def test_expected_counts_down(self):
         model = session_model()
-        outcomes = run(model, sc2.encode_tone(1, 0, 1, 2, 3, 4))
+        data_words = sc2.encode_tone(1, 0, 1, 2, 3, 4)
+        outcomes = send(model, data_words)
         self.assertEqual([sc2.decode_state(outcome.state)["expected"]
                           for outcome in outcomes], [4, 3, 2, 1, 0])
+        # The echo is the whole word, toggle included.
         self.assertEqual([outcome.echo for outcome in outcomes],
-                         sc2.encode_tone(1, 0, 1, 2, 3, 4))
+                         sc2.stamp(data_words, 0)[0])
 
     def test_bye(self):
         model = session_model()
-        outcome = model.word(sc2.BYE)
+        outcome = send(model, [sc2.BYE])[0]
         self.assertEqual(sc2.decode_state(outcome.state)["session"], 0)
         self.assertFalse(model.word(0x1010).accepted)
 
 
-class Framing(unittest.TestCase):
-    def assert_rejected(self, words):
+class Copies(unittest.TestCase):
+    """A word that arrives twice must change nothing but the traffic."""
+
+    def test_every_message_with_every_word_twice(self):
+        for message in sc2.MESSAGES.values():
+            for values in sc2.boundary_cases(message):
+                with self.subTest(case=sc2.describe_case(message, values)):
+                    self.assert_copies_ignored(message.encode(*values))
+        self.assert_copies_ignored(sc2.encode_rumble_stop())
+        self.assert_copies_ignored([sc2.NOP, sc2.CHECKSUM])
+
+    def assert_copies_ignored(self, data_words):
+        clean, twice = session_model(), session_model()
+        words, _ = sc2.stamp(data_words + [sc2.CHECKSUM], clean.toggle)
+        expected = run(clean, words)
+        outcomes = []
+        for word in words:
+            counter = twice.counter
+            outcomes.append(twice.word(word))
+            copy = twice.word(word)
+            self.assertTrue(copy.copy)
+            self.assertFalse(copy.accepted)
+            self.assertEqual(twice.counter, counter + 1)
+            self.assertEqual(copy.state, outcomes[-1].state)
+        self.assertEqual(outcomes, expected)
+        self.assertEqual(twice.queued, clean.queued)
+
+    def test_first_session_word_must_flip_the_toggle(self):
         model = session_model()
-        outcomes = run(model, words)
+        outcome = model.word(sc2.CHECKSUM)
+        self.assertTrue(outcome.copy)
+        self.assertTrue(send(model, [sc2.CHECKSUM])[0].accepted)
+
+    def test_hello_with_every_word_twice(self):
+        model = sc2.Model()
+        for word in sc2.HELLO:
+            self.assertTrue(model.word(word).accepted)
+            self.assertTrue(model.word(word).copy)
+        self.assertEqual(model.counter, 4)
+        self.assertTrue(model.active)
+
+
+class Framing(unittest.TestCase):
+    def assert_rejected(self, data_words):
+        model = session_model()
+        outcomes = send(model, data_words)
         last = outcomes[-1]
         self.assertTrue(last.accepted)
-        self.assertEqual(last.echo, words[-1])
+        self.assertEqual(last.echo & sc2.DATA, data_words[-1])
         self.assertEqual(sc2.decode_state(last.state)["session"], 0)
         return model
 
     def test_rejected_headers(self):
-        for word in (0xE000, 0x8001, 0x1F00, 0x0001, 0x0300, 0x0501,
-                     0x060E, 0x6002, 0x4100):
+        for word in (0x3000, 0x3800, 0x0700, 0x0001, 0x0300, 0x0501,
+                     0x060E, 0x6000, 0x0C00, 0x1008, 0x1005, 0x1C00,
+                     0x2400, 0x2C00):
             with self.subTest(word=hex(word)):
                 self.assert_rejected([word])
 
     def test_rejected_payloads(self):
         self.assert_rejected([sc2.header(sc2.OP_SCRIPT), 0x0100])
-        self.assert_rejected(sc2.encode_tone(0, 0, 1, 2, 3, 4)[:4] + [0x100])
+        self.assert_rejected(sc2.encode_tone(0, 0, 1, 2, 3, 4)[:4] + [0x800])
+        self.assert_rejected(sc2.encode_sweep(0, 0, 1, 2, 3)[:4] + [0x8])
         self.assert_rejected([0x0500, 0x5547])
         self.assert_rejected([0x0603, 0x4D04])
 
-    def test_hello_after_a_lost_count(self):
-        # A HELLO sent into an open message completes it, then its third
-        # word is an undefined CONTROL sub that ends the session, and the
-        # fourth is plain rumble. The client sees session 0 and starts over.
+    def test_hello_words_are_rejected_headers(self):
+        # With the other toggle a HELLO word in a session is rejected and
+        # counts as the first word of a new HELLO.
+        for word in sc2.HELLO:
+            self.assertIsNone(sc2.payload_words(word))
         model = session_model()
-        run(model, sc2.encode_pulse(1, 2, 3, 4)[:2])
+        send(model, [sc2.NOP])
+        self.assertEqual(model.toggle, 1)
         outcomes = run(model, sc2.HELLO)
-        self.assertEqual([outcome.accepted for outcome in outcomes],
-                         [True, True, True, False])
-        self.assertEqual(sc2.decode_state(outcomes[2].state)["session"], 0)
-        outcomes = run(model, sc2.HELLO)
-        self.assertEqual(sc2.decode_state(outcomes[-1].state)["session"], 1)
+        self.assertTrue(all(outcome.accepted for outcome in outcomes))
+        self.assertTrue(model.active)
 
     def test_single_word_message_inside_a_long_one_is_payload(self):
         model = session_model()
         click = sc2.encode_command(3, 2, -10)[0]
-        run(model, sc2.encode_pulse(3, click, 0, 1))
+        send(model, sc2.encode_pulse(3, click, 0, 1))
         self.assertEqual(model.queued, sc2.report_pulse(3, click, 0, 1))
 
     def test_nop_only_at_a_header(self):
         model = session_model()
-        run(model, sc2.encode_pulse(1, 0, 0, 0))
+        send(model, sc2.encode_pulse(1, 0, 0, 0))
         self.assertEqual(model.queued, sc2.report_pulse(1, 0, 0, 0))
-        self.assertEqual(model.word(sc2.NOP).state >> 4 & 7, 0)
+        self.assertEqual(send(model, [sc2.NOP])[0].state >> 4 & 7, 0)
 
     def test_reboot_commands(self):
         model = session_model()
-        run(model, sc2.encode_bootloader())
+        send(model, sc2.encode_bootloader())
         self.assertEqual(model.reboot, "bootloader")
         model = session_model()
-        run(model, sc2.encode_mode(1))
+        send(model, sc2.encode_mode(1))
         self.assertEqual(model.reboot, 1)
 
 
