@@ -388,6 +388,11 @@ driver matches). Dynamic-mount, STREAM-style. **Registers a set-report callback.
 - IMU passes through raw: the SInput wire frame (+x left, +y forward, +z up) IS the SC2's
   own frame, and accel/gyro keep the SAME permutation (the fusion-handedness constraint).
 
+### `mode_sc2link.cpp` / `mode_sc2link.h`  (`g_sc2LinkCtl`, MODE_SC2LINK)
+Static, PUSH-style, one controller: own class driver on interface 0 for xpad (usbd
+`sc2Xfer` stages rumble, the loop relays it) and three Multi-axis HID nodes fed by
+`usbTxHid` from `onReport45`. Layout in docs/PROTOCOL.md §9.5.
+
 ### `gamepad_util.cpp` / `gamepad_util.h` — shared report-builders (called from loop task)
 `swStick`, `psNeutralCalib` (writes through `buf[33]`), trackpad→touch mappers
 (`touchPackPads` writes 8 bytes = two 4-byte points), `psButtonsFromSteam` (back-paddle/

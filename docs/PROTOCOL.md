@@ -417,6 +417,56 @@ synthetic native fixtures are not evidence of acceptance by a real console.
 - Also answers the XID report requests the protocol carries on EP0, in parallel with the interrupt
   endpoints: `GET_REPORT` (`0xA1 0x01`, `wValue 0x0100`) and `SET_REPORT` (`0x21 0x09`, `wValue 0x0200`)
 
+### 9.5 SC2 Link mode
+
+`MODE_SC2LINK` (`13`), selected by number only (panel `0x03`, console `x13`). One controller for a Linux
+client that reads evdev only, such as a TV streaming app: xpad binds interface 0 as an ordinary Xbox 360 pad,
+hid-generic binds interfaces 1 to 3 as three input nodes carrying the raw state.
+
+- VID:PID `045E:028E` (xpad binds an Xbox 360 interface only under a vendor in its table), `bcdDevice=0x5C21`
+  (the xpad node's evdev version, which tells this mode from Xbox mode's `0x0114`), device class
+  `00/00/00` (on a vendor-class device the USB core skips class-only interface matches, and usbhid matches on
+  class alone), strings "OpenPuck" / "SC2 Link", so the HID nodes are named "OpenPuck SC2 Link".
+- Every endpoint is interrupt, 32 bytes, `bInterval` 1. The WebUSB panel follows as interface 4; there is no
+  wake mouse and no CDC.
+
+| Itf | Class | Endpoints | Linux | Node phys suffix |
+|---|---|---|---|---|
+| 0 | `FF/5D/01` | `0x81` IN, `0x02` OUT | xpad | `/input0`, Xbox 360 report as in Xbox mode, rumble OUT |
+| 1 | HID | `0x82` IN | hid-generic | `/input1`, controls, 20 bytes |
+| 2 | HID | `0x83` IN | hid-generic | `/input2`, pads, 18 bytes |
+| 3 | HID | `0x84` IN | hid-generic | `/input3`, motion, 12 bytes |
+
+Each HID node is one Multi-axis Controller application without report IDs, so every kernel makes one input
+device per interface, with 16-bit fields of logical range −32768..32767 and no fuzz. An unsigned value travels
+as its u16 bit pattern. No node has both `ABS_X` and `ABS_Y` or all of `ABS_RX`/`ABS_RY`/`ABS_RZ`, so SDL
+takes none for a joystick or an accelerometer. Values are copied from the RF report unchanged (§8).
+
+| Node | Offset | evdev code | Content |
+|---|---|---|---|
+| controls | 0 | `ABS_MISC` | sample counter, +1 per fresh RF state |
+| | 2, 4 | `ABS_THROTTLE`, `ABS_RUDDER` | buttons bits 0..15, 16..31 (§8.1) |
+| | 6, 8 | `ABS_X`, `ABS_Z` | left stick X, Y |
+| | 10, 12 | `ABS_RX`, `ABS_RY` | right stick X, Y |
+| | 14 | `ABS_WHEEL` | status: bit 0 controller connected, bits 1..3 charge state, bits 4..10 battery percent, bit 11 battery known |
+| | 16, 18 | `ABS_GAS`, `ABS_BRAKE` | left, right trigger (u16) |
+| pads | 0, 2, 4 | `ABS_X`, `ABS_Z`, `ABS_RX` | left pad X, Y, pressure |
+| | 6, 8, 10 | `ABS_RY`, `ABS_THROTTLE`, `ABS_RUDDER` | right pad X, Y, pressure |
+| | 12 | `ABS_WHEEL` | bit 0 left pad touched, bit 1 right pad touched |
+| | 14, 16 | `ABS_GAS`, `ABS_BRAKE` | zero |
+| motion | 0, 2, 4 | `ABS_X`, `ABS_Z`, `ABS_RX` | accelerometer X, Y, Z |
+| | 6, 8, 10 | `ABS_RY`, `ABS_THROTTLE`, `ABS_RUDDER` | gyroscope X, Y, Z |
+
+- Each fresh `0x45`/`0x42`/`0x47` state sends one report per node and an Xbox 360 report; a `0x43` sends a
+  controls report with the new status. The counter exists because the kernel drops unchanged values: without
+  it a still controller sends no frames.
+- The first bond with a live link is the controller. After 1200 ms of silence every node goes neutral with the
+  connected bit clear.
+- The mode forces raw IMU and holds setting 9 (the controller's own pad layer and its trackpad ticks) at 0.
+- Rumble packets (`00 08 00 SS WW 00 00 00`) relay as in Xbox mode. Four in a row, each within 500 ms of the
+  one before, with `SS WW` = `55 46`, `32 B0`, `4F 4B`, `21 21`, reboot into the UF2 bootloader (the
+  "knock"); the first three still rumble.
+
 ## 10. WebUSB control channel
 
 The WebUSB vendor interface is absent in Xbox 360 and clean PlayStation modes.
