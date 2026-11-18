@@ -6,6 +6,7 @@ Run: python3 tools/sc2link/test_sc2link.py
 
 import contextlib
 import io
+import math
 import os
 import struct
 import sys
@@ -57,9 +58,10 @@ class StructLayouts(unittest.TestCase):
 
 class Encoder(unittest.TestCase):
     def test_protocol_example(self):
-        # docs/PROTOCOL.md: COMMAND data 0x4BF6 becomes 82 03 02 F6.
-        self.assertEqual(sc2.encode_command(3, 2, -10), [0x4BF6])
-        self.assertEqual(sc2.report_command(3, 2, -10).hex(), "820302f6")
+        # docs/PROTOCOL.md: COMMAND data 0x4AF6 becomes 82 02 02 F6, a click
+        # on both pads.
+        self.assertEqual(sc2.encode_command(2, 2, -10), [0x4AF6])
+        self.assertEqual(sc2.report_command(2, 2, -10).hex(), "820202f6")
 
     def test_layouts(self):
         # The bit layouts of the message table in docs/PROTOCOL.md.
@@ -504,14 +506,141 @@ class ModelLink:
         return self.dongle.reboot is not None
 
 
+class RecordingDongle(sc2.Model):
+    """The Model, logging (time, report) for each report it relays to the
+    controller and (time, None) where a session starts or ends, which stops
+    rumble."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.clock = 0.0
+        self.log = []
+
+    def word(self, word):
+        active = self.active
+        outcome = super().word(word)
+        if not (active or outcome.accepted or outcome.copy):
+            self.log.append((self.clock, sc2.report_rumble(
+                (word >> 8) * 257, (word & 0xFF) * 257)))
+        if self.active and not active:
+            self.log.append((self.clock, None))
+        return outcome
+
+    def end_session(self):
+        self.log.append((self.clock, None))
+        super().end_session()
+
+    def _run(self, last):
+        if sc2.opcode_of(self.head) != sc2.OP_CONTROL:
+            self.log.append(
+                (self.clock, sc2.build_report(self.head, self.payload)))
+        return super()._run(last)
+
+
+class TimedLink(ModelLink):
+    """ModelLink over a RecordingDongle, each word taking one resend timeout
+    and each listen or silence its length."""
+
+    made = []
+
+    def __init__(self, dongle_nodes):
+        super().__init__(dongle_nodes)
+        self.dongle = RecordingDongle(counter=200, linked=self.linked)
+        self.acks = ModelAcks(self.dongle)
+        self.made.append(self)
+
+    def quiet(self, seconds):
+        self.dongle.clock += seconds
+        super().quiet(seconds)
+
+    def send(self, word, in_session=False):
+        ack = super().send(word, in_session)
+        self.dongle.clock += sc2.RESEND_AFTER_S
+        return ack
+
+    def send_plain(self, word, listen_s=0.1):
+        taken = super().send_plain(word, listen_s)
+        self.dongle.clock += listen_s
+        return taken
+
+
+# How long the controller plays a report, from its fields and the meanings in
+# docs/PROTOCOL.md 9.5.1. Where the sources leave it open: forever.
+TICK_S = 0.018
+CLICK_S = 0.024
+# The stock firmware's scripts as reverse engineered (mwdmwd/sc26re): up to
+# 3 s, no stop. Other ids play nothing.
+SCRIPT_IDS = range(1, 17)
+SCRIPT_S = 3.0
+# The dongle refreshes a rumble until the next 0x80 or session edge, and the
+# controller plays each 0x80 for 100 ms (sc26re).
+RUMBLE_HOLD_S = 0.1
+
+
+def effect_seconds(report):
+    """Seconds a report other than 0x80 plays."""
+    kind = report[0]
+    if kind == 0x81:
+        _, _, on_us, off_us, repeat = struct.unpack("<BBHHH", report)
+        # No on time plays nothing, no repeat may still play once.
+        return max(repeat, 1) * (on_us + off_us) / 1e6 if on_us else 0.0
+    if kind == 0x82:
+        return {0: 0.0, 1: TICK_S, 2: CLICK_S}.get(report[2], math.inf)
+    if kind == 0x85:
+        return SCRIPT_S if report[2] in SCRIPT_IDS else 0.0
+    duration_ms = struct.unpack_from("<H", report, 5 if kind == 0x83 else 3)[0]
+    return duration_ms / 1000 if duration_ms else math.inf
+
+
+def effects(log):
+    """(report, seconds) for each report in a RecordingDongle's log."""
+    for index, (start, report) in enumerate(log):
+        if report is None:
+            continue
+        if report[0] != 0x80:
+            yield report, effect_seconds(report)
+        elif report[1]:
+            ends = [time for time, later in log[index + 1:]
+                    if later is None or later[0] == 0x80]
+            yield report, (ends[0] - start + RUMBLE_HOLD_S if ends
+                           else math.inf)
+
+
+class Effects(unittest.TestCase):
+    def test_effect_seconds(self):
+        # The selftest's old copy case: 65535 pulses of 65.5 ms on and off.
+        self.assertGreater(effect_seconds(
+            sc2.report_pulse(0, 0xFFFF, 0xFFFF, 0xFFFF)), 8000)
+        self.assertEqual(effect_seconds(
+            sc2.report_pulse(0, 0, 0xFFFF, 0xFFFF)), 0.0)
+        self.assertEqual(effect_seconds(
+            sc2.report_pulse(1, 0xFFFF, 0, 0)), 0.065535)
+        self.assertEqual(effect_seconds(
+            sc2.report_tone(0, -128, 0, 0, 0, 0)), math.inf)
+        self.assertEqual(effect_seconds(
+            sc2.report_sweep(0, -128, 300, 0, 0)), 0.3)
+        self.assertEqual(effect_seconds(sc2.report_command(0, 7, -128)),
+                         math.inf)
+        self.assertEqual(effect_seconds(sc2.report_script(0, 5, -128)),
+                         SCRIPT_S)
+
+    def test_rumble_lasts_until_the_next(self):
+        on, off = sc2.report_rumble(1, 0), sc2.report_rumble(0, 0)
+        self.assertEqual(list(effects([(1.0, on), (1.5, off)])),
+                         [(on, 0.5 + RUMBLE_HOLD_S)])
+        self.assertEqual(list(effects([(1.0, on), (1.25, None)])),
+                         [(on, 0.25 + RUMBLE_HOLD_S)])
+        self.assertEqual(list(effects([(1.0, on)])), [(on, math.inf)])
+
+
 class Subcommands(unittest.TestCase):
     """Each subcommand from argv to exit code, the Model as the dongle."""
 
-    def run_main(self, *argv, linked=True):
+    def run_main(self, *argv, linked=True, base=ModelLink):
         nodes = types.SimpleNamespace(
             prefix="usb-test", xpad=types.SimpleNamespace(path="/x"),
             pads=types.SimpleNamespace(path="/p"))
-        link = type("Link", (ModelLink,), {"linked": linked})
+        link = type("Link", (base,), {"linked": linked})
         output = io.StringIO()
         with mock.patch.object(sc2, "choose_dongle", return_value=nodes), \
                 mock.patch.object(sc2, "controller_linked",
@@ -528,6 +657,16 @@ class Subcommands(unittest.TestCase):
             self.assertEqual(code, 0, output)
             self.assertNotIn("FAIL", output)
             self.assertEqual("CHECK by hand" in output, linked)
+
+    def test_selftest_effects_end_within_a_second(self):
+        TimedLink.made.clear()
+        code, output = self.run_main("selftest", base=TimedLink)
+        self.assertEqual(code, 0, output)
+        played = list(effects(TimedLink.made[0].dongle.log))
+        self.assertGreater(len(played), 50)
+        for report, seconds in played:
+            with self.subTest(report=report.hex(" ")):
+                self.assertLessEqual(seconds, 1.0)
 
     def test_send_every_message(self):
         for message in sc2.MESSAGES.values():
