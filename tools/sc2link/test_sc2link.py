@@ -244,6 +244,20 @@ class Framing(unittest.TestCase):
         self.assertEqual(model.reboot, 1)
 
 
+class Discovery(unittest.TestCase):
+    def test_hid_nodes_carry_the_hid_version(self):
+        # As seen on Linux 7.3: only the xpad node reports bcdDevice.
+        prefix = "usb-0000:00:14.0-2"
+        nodes = [sc2.Node(f"/dev/input/event{index}", "", prefix + suffix,
+                          0x045E, 0x028E, version)
+                 for index, (suffix, version) in enumerate(
+                     (("/input0", 0x5C21), ("/input1", 0x0111),
+                      ("/input2", 0x0111), ("/input3", 0x0111)))]
+        dongles = sc2.find_dongles(nodes)
+        self.assertEqual(len(dongles), 1)
+        self.assertEqual(dongles[0].pads.path, "/dev/input/event2")
+
+
 class CommandLine(unittest.TestCase):
     def parse(self, *argv):
         return sc2.build_parser().parse_args(list(argv))

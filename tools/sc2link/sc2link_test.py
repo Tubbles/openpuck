@@ -30,7 +30,7 @@ import time
 
 XPAD_VENDOR = 0x045E
 XPAD_PRODUCT = 0x028E
-# bcdDevice of SC2 Link, the evdev version of all four nodes.
+# bcdDevice of SC2 Link, the evdev version of the xpad node.
 XPAD_VERSION = 0x5C21
 NODE_SUFFIXES = {
     "xpad": "/input0",
@@ -572,6 +572,9 @@ def is_sc2link_node(node):
 def find_dongles(nodes):
     """Nodes of one USB device share the phys prefix, the interface differs."""
     ours = [node for node in nodes if is_sc2link_node(node)]
+    # usbhid reports the HID version (0x0111) on its nodes, not bcdDevice.
+    hid_nodes = [node for node in nodes
+                 if (node.vendor, node.product) == (XPAD_VENDOR, XPAD_PRODUCT)]
     dongles = []
     for xpad in ours:
         if not xpad.phys.endswith(NODE_SUFFIXES["xpad"]):
@@ -579,7 +582,7 @@ def find_dongles(nodes):
         prefix = xpad.phys[:-len(NODE_SUFFIXES["xpad"])]
         found = {"xpad": xpad}
         for role in ("controls", "pads", "motion"):
-            for node in ours:
+            for node in hid_nodes:
                 if node.phys == prefix + NODE_SUFFIXES[role]:
                     found[role] = node
         if len(found) == 4:
@@ -604,8 +607,9 @@ def choose_dongle(phys_prefix):
         hint = (f"; {len(refused)} event nodes could not be opened "
                 f"({refused[0][1].strerror}): run as root or join the input "
                 "group")
-    raise SystemExit("no SC2 Link dongle found: four event nodes 045e:028e "
-                     f"version 5c21 on interfaces 0 to 3{hint}")
+    raise SystemExit("no SC2 Link dongle found: an xpad node 045e:028e "
+                     "version 5c21 and HID nodes on interfaces 1 to 3 of "
+                     f"the same device{hint}")
 
 
 def open_node(path, flags):
