@@ -278,6 +278,11 @@ def report_tone(side, gain, frequency_hz, duration_ms, lfo_hz, lfo_depth):
                        duration_ms, lfo_hz, lfo_depth)
 
 
+# The OFF command on both pads, which a session's start and end send to stop
+# every haptic. CHECKSUM covers the one a session end queues.
+STOP_REPORT = report_command(3, 0, 0)
+
+
 def crc16(data):
     """CRC-16/CCITT-FALSE, the CHECKSUM command's."""
     return binascii.crc_hqx(bytes(data), 0xFFFF)
@@ -490,8 +495,10 @@ class Model:
         return ack_state(self.counter, self.active, expected)
 
     def end_session(self):
+        """BYE, a rejected word or the timeout, with its stop."""
         self.active = False
         self.need = 0
+        self.queued = STOP_REPORT if self.linked else b""
 
     def word(self, word):
         if self._copy(word):
@@ -1276,9 +1283,8 @@ class SelfTest:
         """After a surprise: let the session time out and open a new one."""
         self.link.quiet(SILENCE_S)
         self.link.acks.refresh()
-        queued = self.model.queued
         self.model = Model(self.link.acks.counter(), self.model.linked)
-        self.model.queued = queued
+        self.model.end_session()
         for word in HELLO:
             self.model.word(word)
             if self.link.send(word) is None:
@@ -1389,23 +1395,53 @@ def selftest_framing(test):
               test.stamp(encode_pulse(3, click, 0, 1) + [CHECKSUM]))
 
 
+def time_out(test, name):
+    """Silence until the session ends, then the state it left."""
+    test.link.quiet(SILENCE_S)
+    test.link.acks.refresh()
+    state = test.link.acks.state
+    test.model.end_session()
+    problems = []
+    if state != test.model.state():
+        problems.append(f"{format_state(state)}, expected "
+                        f"{format_state(test.model.state())}")
+    test.record(name, problems)
+    test.model.counter = state >> 8
+
+
 def selftest_truncated(test):
     tone = test.stamp(encode_tone(0, -128, 1000, 10, 0, 0))
     if not test.case("a truncated message waits for its payload", tone[:3]):
         return
-    test.link.quiet(SILENCE_S)
-    test.link.acks.refresh()
-    state = test.link.acks.state
-    expected = ack_state(test.model.counter, False, 0)
-    problems = []
-    if state != expected:
-        problems.append(f"{format_state(state)}, expected "
-                        f"{format_state(expected)}")
-    test.record("the session timeout drops it", problems)
-    test.model.end_session()
-    test.model.counter = state >> 8
+    time_out(test, "the session timeout drops it")
     test.hello("HELLO after the timeout opens a new session")
-    test.case("the dropped message queued no report", test.stamp([CHECKSUM]))
+    test.case("CHECKSUM shows the timeout's stop, not the dropped message",
+              test.stamp([CHECKSUM]))
+
+
+def selftest_stop(test):
+    """A pulse train that only the session timeout can stop."""
+    if not test.model.linked:
+        print("SKIP the session timeout stops a pulse train: no controller")
+        return
+    pulse = encode_pulse(3, 20000, 20000, 1000)
+    if not test.case("a 40 s pulse train on both pads starts",
+                     test.stamp(pulse)):
+        return
+    problems = []
+    for _ in range(5):
+        test.link.quiet(IDLE_NOP_S)
+        problems += test.step(test.stamp([NOP])[0])
+    test.record("NOPs keep the session for 1 s", problems)
+    if problems:
+        test.restart()
+        return
+    time_out(test, "the session times out")
+    print("CHECK by hand: both pads fell silent about 0.5 s after the last "
+          "NOP. The tool cannot feel the controller.")
+    test.hello("HELLO after the timeout opens a new session")
+    test.case("CHECKSUM shows the OFF report the timeout queued",
+              test.stamp([CHECKSUM]))
 
 
 def percentile(sorted_values, fraction):
@@ -1433,9 +1469,8 @@ def command_selftest(args):
         selftest_copies(test)
         selftest_framing(test)
         selftest_truncated(test)
-        test.case("clean up: haptics off on both sides, rumble stop, BYE",
-                  test.stamp(encode_command(3, 0, 0) + encode_rumble_stop()
-                             + [BYE]))
+        selftest_stop(test)
+        test.case("clean up: BYE stops every haptic", test.stamp([BYE]))
         failed = sum(1 for _, problems in test.results if problems)
         times = sorted(link.round_trips_ns)
         print(f"words acknowledged: {len(times)}, resends: {link.resends}")

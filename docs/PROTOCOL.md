@@ -512,7 +512,7 @@ acknowledgement again, which is identical, so evdev shows no new frame.
         HELLO: 0102 0201 0103 0301, in a row, each within 500 ms, each acknowledged
 PLAIN ───────────────────────────────────────────────────────────────────────────▶ SESSION
   ▲                                                                                   │
-  └──────── BYE, a rejected word, or 500 ms without a word: rumble stop burst ────────┘
+  └────────── BYE, a rejected word, or 500 ms without a word: haptics stop ───────────┘
 ```
 
 - Outside a session every word is plain rumble except a knock packet and a word that matches the next HELLO
@@ -524,12 +524,15 @@ PLAIN ────────────────────────�
   bit clear and then counts as a word outside the session, a knock step or the first HELLO word, but is never
   relayed. A HELLO inside a session is a copy or a rejected word, depending on the toggle.
 - 500 ms without a word ends a session; an idle client sends NOP every 200 ms. A restarting client waits 500 ms
-  of silence before its HELLO, which also clears a parser left mid-message. Ending stops the rumble (`0x80`
-  zero as a stop burst) and drops a partial message.
+  of silence before its HELLO, which also clears a parser left mid-message. Ending drops a partial message.
+- Starting and ending a session stop every haptic on both sides, so stray words that were plain rumble and
+  effects a vanished client left running end there: the `0x80` zero as a stop burst, then `82 03 00 00` (OFF,
+  `HAPTIC_TYPE_OFF` in SDL's `controller_structs.h`, on both sides) three times, since the relay is not
+  acknowledged. Unverified on a controller: that OFF ends a running pulse train, tone, sweep or script.
 - While the last RUMBLE is non-zero the dongle resends its `0x80` every 40 ms, as SDL does: the controller
   stops a rumble that is not refreshed within about 50 ms.
 - The last word of a message that queues a report is accepted only while the controller's relay ring has room
-  for a stop burst (3 entries). A full ring therefore delays the acknowledgement, and the client's resend
+  for a session's stop (6 entries). A full ring therefore delays the acknowledgement, and the client's resend
   retries. Without a linked controller the word is accepted and its report dropped.
 
 **Messages.** The bits below are data bits 14..0. A header with bit 14 set is a COMMAND; otherwise bits 13..11
@@ -563,15 +566,16 @@ report `82 03 02 F6`.
 | `0x06` | MODE | mode number | `0x4D00` \| mode | stores the mode as panel `0x03` does and reboots into it; rejected for an invalid mode |
 
 The rebooting commands act only on their confirmation word, so a client that lost count cannot reboot the
-dongle with one stray word. The dongle acknowledges the confirmation, stops the rumble, and reboots 50 ms
+dongle with one stray word. The dongle acknowledges the confirmation, stops every haptic, and reboots 50 ms
 later. A build with `OPK_SC2LINK_FORCE` boots into SC2 Link whatever mode was stored.
 
 CHECKSUM is a test aid. Its acknowledgement advances the counter as usual, but `ACK_ECHO` holds the
 CRC-16/CCITT-FALSE (polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR; Python's
 `binascii.crc_hqx(data, 0xFFFF)`) of the report the last report-building message queued for the controller,
-report id included: `82 03 02 F6` for the example above. It is `0xFFFF` (the CRC of nothing) when that
-message's report was not queued, for instance with no controller linked. RUMBLE resends and session-end stops
-are not messages and leave it alone. A host compares it with the CRC of the report it expects.
+report id included: `82 03 02 F6` for the example above. A session end counts with its OFF report, `82 03 00
+00`, so a new session's CHECKSUM shows whether the last one's stop was queued; the stop at a session's start and
+RUMBLE resends leave it alone. It is `0xFFFF` (the CRC of nothing) when that report was not queued, for
+instance with no controller linked. A host compares it with the CRC of the report it expects.
 
 `tools/sc2link/sc2link_test.py` speaks this protocol from a Linux host: decoded nodes, single messages,
 a selftest of every message and rule, and the reboot commands (`--help`). `test_sc2link.py` beside it checks

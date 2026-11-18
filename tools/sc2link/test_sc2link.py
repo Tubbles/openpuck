@@ -156,6 +156,21 @@ class Decoder(unittest.TestCase):
         outcomes = send(model, sc2.encode_rumble(1, 2) + [sc2.CHECKSUM])
         self.assertEqual(outcomes[-1].echo, 0xFFFF)
 
+    def test_session_end_queues_the_stop(self):
+        # A message, BYE, a new session: CHECKSUM covers the end's OFF,
+        # since a session start queues the same stop but leaves CHECKSUM.
+        self.assertEqual(sc2.STOP_REPORT.hex(), "82030000")
+        for linked, expected in ((True, sc2.crc16(sc2.STOP_REPORT)),
+                                 (False, 0xFFFF)):
+            model = session_model(linked)
+            send(model, sc2.encode_pulse(3, 20000, 20000, 1000) + [sc2.BYE])
+            run(model, sc2.HELLO)
+            self.assertEqual(send(model, [sc2.CHECKSUM])[0].echo, expected)
+            # A rejected word ends the session the same way.
+            send(model, sc2.encode_command(1, 1, 0) + [0x3800])
+            run(model, sc2.HELLO)
+            self.assertEqual(send(model, [sc2.CHECKSUM])[0].echo, expected)
+
     def test_crc_check_value(self):
         self.assertEqual(sc2.crc16(b"123456789"), 0x29B1)
         self.assertEqual(sc2.crc16(b""), 0xFFFF)

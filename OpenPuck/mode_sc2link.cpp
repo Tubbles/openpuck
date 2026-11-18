@@ -53,6 +53,12 @@ SC2LinkController g_sc2LinkCtl;
 #define SC2_MAX_PAYLOAD 4
 // A controller report with its id, the longest being 0x80 and 0x83.
 #define SC2_REPORT_MAX 10
+// The command report that stops the effects of 0x81 to 0x85: command 0 is
+// HAPTIC_TYPE_OFF in SDL's controller_structs.h, side 3 both pads, gain 0.
+static const uint8_t SC2_HAPTIC_OFF[] = { 0x82, 3, 0, 0 };
+// A session's start and end each queue a rumble stop burst and as many OFF
+// reports, since the relay is not acknowledged.
+#define SC2_STOP_ENTRIES (2 * RUMBLE_STOP_REPS)
 
 // A header with data bit 14 set is a COMMAND, whose 13 bits leave no room for
 // a 3-bit opcode in one word. Otherwise the opcode is in bits 13 to 11.
@@ -310,8 +316,8 @@ struct Sc2Session {
 	uint8_t rumble[HAPTIC_RUMBLE_LEN];
 	bool rumbleOn;
 	unsigned long rumbleMs;
-	// The report the last report-building message queued, for CHECKSUM.
-	// Length 0 when that message's report was dropped.
+	// The report the last report-building message or session end queued,
+	// for CHECKSUM. Length 0 when it was dropped.
 	uint8_t report[SC2_REPORT_MAX];
 	uint8_t reportLength;
 };
@@ -843,12 +849,12 @@ static uint8_t sc2BuildReport(uint16_t header, const uint16_t *payload,
 	}
 }
 
-// Room in the relay for the largest report, a rumble stop burst. A report the
-// gates will drop needs none.
+// Room in the relay for a session's stop after the report. A report the gates
+// will drop needs none.
 static bool sc2RelayRoom(void)
 {
 	return g_sc2Bond < 0 || haptic82Blocked(g_sc2Bond) ||
-	       relayFree((uint8_t)g_sc2Bond) >= RUMBLE_STOP_REPS;
+	       relayFree((uint8_t)g_sc2Bond) >= SC2_STOP_ENTRIES;
 }
 
 // The last word of a message that queues a report is accepted only while the
@@ -880,31 +886,53 @@ static bool sc2QueueReport(const uint8_t *report, uint8_t length)
 			    bond);
 }
 
-// Stops the rumble and drops a partial message. Words are plain rumble again.
+// Every kind of haptic on both sides: the rumble of 0x80 and, through OFF,
+// the pulses, tones, sweeps and scripts. A stop passes the gates a stop of
+// plain rumble passes. True when the OFF reports were queued.
+static bool sc2StopHaptics(void)
+{
+	g_sc2Session.rumbleOn = false;
+	if (g_sc2Bond < 0)
+		return false;
+	uint8_t bond = (uint8_t)g_sc2Bond;
+	uint8_t stop[HAPTIC_RUMBLE_LEN];
+	hapticRumbleReport(0, 0, stop);
+	hapticRumbleQueue(stop, bond);
+	if (!hapticLinkUp(bond))
+		return false;
+	bool queued = false;
+	for (uint8_t i = 0; i < RUMBLE_STOP_REPS; i++)
+		if (relayEnqueue(SC2_HAPTIC_OFF[0], SC2_HAPTIC_OFF + 1,
+				 sizeof SC2_HAPTIC_OFF - 1, true, bond))
+			queued = true;
+	return queued;
+}
+
+// Stops every haptic and drops a partial message. Words are plain rumble
+// again. The OFF report counts for CHECKSUM, so a client can tell from the
+// next session that the stop was queued.
 static void sc2EndSession(void)
 {
 	Sc2Session &session = g_sc2Session;
 	session.active = false;
 	session.need = 0;
-	session.rumbleOn = false;
-	if (g_sc2Bond < 0)
-		return;
-	uint8_t stop[HAPTIC_RUMBLE_LEN];
-	hapticRumbleReport(0, 0, stop);
-	hapticRumbleQueue(stop, (uint8_t)g_sc2Bond);
+	session.reportLength = sc2StopHaptics() ? sizeof SC2_HAPTIC_OFF : 0;
+	memcpy(session.report, SC2_HAPTIC_OFF, session.reportLength);
 }
 
 static void sc2StartSession(unsigned long ms)
 {
 	Sc2Session &session = g_sc2Session;
-	// A plain rumble that came before the HELLO still goes out first.
-	sc2RelayRumble();
+	// Stray words before the HELLO were plain rumble at their byte values:
+	// a session starts from silence, with the same stop as its end, which
+	// leaves CHECKSUM to that end.
+	g_sc2PlainPending = false;
+	sc2StopHaptics();
 	session.active = true;
 	session.hello = 0;
 	session.need = 0;
 	session.toggle =
 		(uint8_t)(SC2_HELLO[SC2_HELLO_WORDS - 1] >> SC2_TOGGLE_SHIFT);
-	session.rumbleOn = false;
 	session.wordMs = ms;
 }
 
@@ -1106,7 +1134,7 @@ static void sc2SessionTask(void)
 	hapticRumbleQueue(session.rumble, (uint8_t)g_sc2Bond);
 }
 
-// Stops the rumble a knock or a session started, then reboots the way the
+// Stops the haptics a knock or a session started, then reboots the way the
 // panel does: opcode 0x0C into the UF2 bootloader, opcode 0x03 into a mode.
 static void sc2RebootTask(void)
 {
