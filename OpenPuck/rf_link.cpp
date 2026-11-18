@@ -4162,6 +4162,9 @@ static void rfConnStep()
 
 void rfLinkTask()
 {
+	// Rumble echo test build: no radio, so loop() (which sends the echo
+	// reports) never stalls on a poll, a beacon or a channel survey.
+	return;
 	rfChannelHandoffTask();
 	rfJournalBuilderTask();
 	if (rfChannelHandoffOwnsRadio())
