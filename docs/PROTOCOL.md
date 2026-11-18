@@ -453,7 +453,7 @@ takes none for a joystick or an accelerometer. Values are copied from the RF rep
 | pads | 0, 2, 4 | `ABS_X`, `ABS_Z`, `ABS_RX` | left pad X, Y, pressure |
 | | 6, 8, 10 | `ABS_RY`, `ABS_THROTTLE`, `ABS_RUDDER` | right pad X, Y, pressure |
 | | 12 | `ABS_WHEEL` | bit 0 left pad touched, bit 1 right pad touched |
-| | 14, 16 | `ABS_GAS`, `ABS_BRAKE` | zero |
+| | 14, 16 | `ABS_GAS`, `ABS_BRAKE` | `ACK_ECHO`, `ACK_STATE` (§9.5.1) |
 | motion | 0, 2, 4 | `ABS_X`, `ABS_Z`, `ABS_RX` | accelerometer X, Y, Z |
 | | 6, 8, 10 | `ABS_RY`, `ABS_THROTTLE`, `ABS_RUDDER` | gyroscope X, Y, Z |
 
@@ -463,9 +463,87 @@ takes none for a joystick or an accelerometer. Values are copied from the RF rep
 - The first bond with a live link is the controller. After 1200 ms of silence every node goes neutral with the
   connected bit clear.
 - The mode forces raw IMU and holds setting 9 (the controller's own pad layer and its trackpad ticks) at 0.
-- Rumble packets (`00 08 00 SS WW 00 00 00`) relay as in Xbox mode. Four in a row, each within 500 ms of the
-  one before, with `SS WW` = `55 46`, `32 B0`, `4F 4B`, `21 21`, reboot into the UF2 bootloader (the
-  "knock"); the first three still rumble.
+- Outside a session (§9.5.1) rumble packets (`00 08 00 SS WW 00 00 00`) relay as in Xbox mode. Four in a
+  row, each within 500 ms of the one before, with `SS WW` = `55 46`, `32 B0`, `4F 4B`, `21 21`, reboot into
+  the UF2 bootloader (the "knock"); the first three still rumble.
+
+#### 9.5.1 Word protocol
+
+A client with only the event nodes reaches the controller's haptic reports `0x80` to `0x85` through rumble.
+A word is 16 bits. The client sets `FF_GAIN` to `0xFFFF` (ff-memless scales every magnitude by the gain),
+then per word uploads `FF_RUMBLE` with strong = `word & 0xFF00`, weak = `(word & 0xFF) << 8` into its one
+playing effect (`EVIOCSFF`) and writes an `EV_FF` play event. xpad sends `00 08 00 SS WW 00 00 00`, and the
+word is `SS << 8 | WW`. The dongle answers on the pads node:
+
+- `ACK_ECHO` (`ABS_GAS`): the last accepted word.
+- `ACK_STATE` (`ABS_BRAKE`):
+
+| Bits | Content |
+|---|---|
+| 15..8 | accepted words, mod 256 |
+| 7 | session active |
+| 6..4 | payload words the parser still expects; outside a session, HELLO words still to come |
+| 3..0 | protocol version, `1` |
+
+Each accepted word sends a pads report. The counter changes with every one, so each acceptance is a new evdev
+frame even when `ACK_ECHO` repeats; the other pads reports carry the same values. Plain rumble is never
+acknowledged.
+
+**Stop-and-wait.** One word in flight: the next goes out once the counter has advanced by one from its value
+before the previous word, which is how the client tells that word's acknowledgement from the last one. With no
+advance after 30 ms the client reads `ACK_STATE` with `EVIOCGABS` and resends the same word if the counter has
+still not moved. An advance by more than one means the dongle took a word the client did not send (another FF
+client on the node); the client then starts over. Linux 6.12 xpad keeps one pending packet that a newer one
+overwrites during a transfer, and 4.4 xpad fails a write during a transfer, so words cannot be pipelined.
+
+**Session.**
+
+```text
+        HELLO: 0102 0201 0103 0301, in a row, each within 500 ms, each acknowledged
+PLAIN ───────────────────────────────────────────────────────────────────────────▶ SESSION
+  ▲                                                                                   │
+  └──────── BYE, a rejected word, or 500 ms without a word: rumble stop burst ────────┘
+```
+
+- Outside a session every word is plain rumble except a knock packet and a word that matches the next HELLO
+  word, which is acknowledged and not relayed. A word that does not match restarts the HELLO.
+- In a session every word goes to the parser. RUMBLE speeds are relayed verbatim, without the rumble style
+  and strength.
+- A word the parser rejects (opcode 7, an undefined CONTROL sub or argument, a non-zero unused header bit, a
+  non-zero unused bit of a narrow payload field) ends the session. It is acknowledged with the session bit
+  clear and then counts as a word outside the session, a knock step or the first HELLO word, but is never
+  relayed. A HELLO sent at a message boundary therefore restarts a running session.
+- 500 ms without a word ends a session; an idle client sends NOP every 200 ms. A restarting client waits 500 ms
+  of silence before its HELLO, which also clears a parser left mid-message. Ending stops the rumble (`0x80`
+  zero as a stop burst) and drops a partial message.
+- While the last RUMBLE is non-zero the dongle resends its `0x80` every 40 ms, as SDL does: the controller
+  stops a rumble that is not refreshed within about 50 ms.
+- The last word of a message that queues a report is accepted only while the controller's relay ring has room
+  for a stop burst (3 entries). A full ring therefore delays the acknowledgement, and the client's resend
+  retries. Without a linked controller the word is accepted and its report dropped.
+
+**Messages.** Header bits 15..13 are the opcode, unused bits are zero. Payload words follow the header. Inside a
+message every word is payload: a single-word message cannot interrupt a longer one and waits until it is
+complete. `side`: 0 none, 1 left, 2 right, 3 both. Gains are s8 dB. Report fields are little-endian.
+
+| Op | Name | Header bits 12..0 | Payload words | Words | Report sent |
+|---|---|---|---|---|---|
+| 0 | CONTROL | 12..8 sub, 7..0 argument | per sub | 1 | none |
+| 1 | COMMAND | 12..11 side, 10..8 command, 7..0 gain | none | 1 | `82 side command gain` |
+| 2 | SCRIPT | 12..11 side, 7..0 gain | script id (7..0) | 2 | `85 side script gain` |
+| 3 | RUMBLE | bit 0: stop | left speed, right speed; none for a stop | 3, 1 | `80 type intensity left 00 right 00` |
+| 4 | PULSE | 12..11 side | on µs, off µs, repeat | 4 | `81 side on off repeat` |
+| 5 | SWEEP | 12..11 side, 7..0 gain | duration ms, start Hz, end Hz | 4 | `84 side gain duration start end` |
+| 6 | TONE | 12..11 side, 7..0 gain | frequency Hz, duration ms, LFO Hz, LFO depth (7..0) | 5 | `83 side gain frequency duration lfo depth` |
+| 7 | reserved | | | | rejected |
+
+RUMBLE builds `0x80` as Xbox mode does: type 4, or 0 with both speeds zero; intensity the larger speed; both
+gains 0. Example: a click on both pads at −10 dB is COMMAND `0x3AF6`, report `82 03 02 F6`.
+
+| CONTROL sub | Name | Argument | Payload | Effect |
+|---|---|---|---|---|
+| `0x00` | NOP | 0 | none | keeps the session |
+| `0x02` | BYE | 0 | none | ends the session |
 
 ## 10. WebUSB control channel
 

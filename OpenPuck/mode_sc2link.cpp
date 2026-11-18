@@ -1,6 +1,8 @@
 // One controller as an Xbox 360 pad on interface 0, which Linux xpad binds,
 // and as three HID Multi-axis nodes on interfaces 1 to 3, which hid-generic
-// binds. setup() adds the WebUSB panel after them as interface 4.
+// binds. setup() adds the WebUSB panel after them as interface 4. The rumble
+// packets of interface 0 also carry the word protocol of docs/PROTOCOL.md,
+// acknowledged on the pads node.
 #include "mode_sc2link.h"
 #include "mode_xinput.h"
 #include "gamepad_util.h"
@@ -32,7 +34,39 @@ SC2LinkController g_sc2LinkCtl;
 #define SC2_CONTROLS_LEN 20
 #define SC2_CONTROLS_STATUS_AT 14
 #define SC2_PADS_LEN 18
+#define SC2_PADS_ACK_AT 14
 #define SC2_MOTION_LEN 12
+
+// The word protocol. A word is one rumble packet, strong byte high.
+#define SC2_PROTOCOL_VERSION 1
+#define SC2_SESSION_MS 500u
+// SDL refreshes a running rumble this often: the controller stops one that
+// is not refreshed within about 50 ms, and no hop before the dongle resends.
+#define SC2_RUMBLE_RESEND_MS 40u
+// Only a plain rumble flood fills it: a session client has one word in flight.
+#define SC2_WORD_RING 16
+#define SC2_MAX_PAYLOAD 4
+// A controller report with its id, the longest being 0x80 and 0x83.
+#define SC2_REPORT_MAX 10
+
+// Header bits 15 to 13.
+enum Sc2Op {
+	SC2_OP_CONTROL,
+	SC2_OP_COMMAND,
+	SC2_OP_SCRIPT,
+	SC2_OP_RUMBLE,
+	SC2_OP_PULSE,
+	SC2_OP_SWEEP,
+	SC2_OP_TONE,
+};
+// CONTROL subs, header bits 12 to 8.
+#define SC2_CTL_NOP 0x00
+#define SC2_CTL_BYE 0x02
+
+// Each is an undefined CONTROL header, so no message starts with one, and a
+// HELLO sent inside a session at a message boundary restarts the session.
+static const uint16_t SC2_HELLO[] = { 0x0102, 0x0201, 0x0103, 0x0301 };
+static const uint8_t SC2_HELLO_WORDS = sizeof SC2_HELLO / sizeof SC2_HELLO[0];
 
 // Offsets in a 0x45 or 0x42 state: [id][seq][buttons u32][lt][rt][lx][ly]
 // [rx][ry][left pad x, y, pressure][right pad x, y, pressure][IMU time u32]
@@ -198,6 +232,11 @@ class Sc2XboxInterface : public Adafruit_USBD_Interface {
 static Sc2XboxInterface g_sc2XboxItf;
 static Sc2HidInterface g_sc2Controls, g_sc2Pads, g_sc2Motion;
 
+struct Sc2Word {
+	uint16_t value;
+	unsigned long ms;
+};
+
 struct Sc2Usb {
 	// The usbd task publishes endpoint state, the loop owns the reports.
 	volatile bool inUse;
@@ -209,8 +248,9 @@ struct Sc2Usb {
 	uint8_t latest[XINPUT_REPORT_LEN];
 	CFG_TUD_MEM_ALIGN uint8_t inBuf[SC2_PACKET_SIZE];
 	CFG_TUD_MEM_ALIGN uint8_t outBuf[SC2_PACKET_SIZE];
-	volatile uint16_t rumbleLow, rumbleHigh;
-	volatile bool rumblePending;
+	// Rumble words in arrival order, both ends under PRIMASK.
+	Sc2Word words[SC2_WORD_RING];
+	volatile uint8_t wordHead, wordTail;
 	// After a bus reset the host can no longer stop the rumble it started.
 	volatile bool rumbleStop;
 };
@@ -225,10 +265,37 @@ struct Sc2Battery {
 };
 
 // Loop only. The controls report is kept whole for the battery reports that
-// arrive between states.
+// arrive between states, the pads report for the acknowledgements.
 static uint16_t g_sc2Counter;
 static Sc2Battery g_sc2Battery;
 static uint8_t g_sc2ControlsReport[SC2_CONTROLS_LEN];
+static uint8_t g_sc2PadsReport[SC2_PADS_LEN];
+
+// Loop only: the word protocol.
+struct Sc2Session {
+	bool active;
+	// HELLO words matched in a row outside a session, and when the last
+	// one arrived.
+	uint8_t hello;
+	unsigned long helloMs;
+	unsigned long wordMs;
+	// The message being received, and how many payload words are to come.
+	uint16_t header;
+	uint16_t payload[SC2_MAX_PAYLOAD];
+	uint8_t have, need;
+	// ACK_STATE's counter of accepted words, and ACK_ECHO.
+	uint8_t counter;
+	uint16_t echo;
+	// The last 0x80 a RUMBLE built, resent while it rumbles.
+	uint8_t rumble[HAPTIC_RUMBLE_LEN];
+	bool rumbleOn;
+	unsigned long rumbleMs;
+};
+
+static Sc2Session g_sc2Session;
+// Loop only: the latest plain rumble word, relayed once per loop.
+static uint16_t g_sc2PlainWord;
+static bool g_sc2PlainPending;
 
 // Only before attach or after TinyUSB has dropped the endpoints.
 static void sc2UsbClear(void)
@@ -308,9 +375,8 @@ static bool sc2RumblePacket(const uint8_t *data, uint32_t length,
 
 // A host that reaches the pad only through its event node (a TV app, a desktop
 // user without usbfs access) has no panel. For it, four rumble packets in a
-// row, each within 500 ms of the one before, reboot into the UF2 bootloader.
-// The first three still rumble. The word protocol's session commands will
-// replace this.
+// row outside a session, each within 500 ms of the one before, reboot into
+// the UF2 bootloader. The first three still rumble.
 static const uint8_t SC2_BOOT_KNOCK[][2] = {
 	{ 0x55, 0x46 },
 	{ 0x32, 0xB0 },
@@ -323,8 +389,8 @@ static const uint8_t SC2_BOOT_KNOCK_STEPS =
 // Long enough for the rumble stop burst to leave on the following RF polls.
 #define SC2_BOOT_DELAY_MS 50u
 
-// Set on the usbd task, acted on by the loop.
-static volatile bool g_sc2BootRequest;
+// Loop only.
+static bool g_sc2BootRequest;
 
 static bool sc2KnockStep(uint8_t step, uint8_t strong, uint8_t weak)
 {
@@ -332,7 +398,8 @@ static bool sc2KnockStep(uint8_t step, uint8_t strong, uint8_t weak)
 	       weak == SC2_BOOT_KNOCK[step][1];
 }
 
-// usbd task only. True for the packet that completes the sequence.
+// Loop only, with the time the packet arrived. True for the packet that
+// completes the sequence.
 static bool sc2BootKnock(uint8_t strong, uint8_t weak, unsigned long now)
 {
 	static uint8_t matched;
@@ -349,25 +416,40 @@ static bool sc2BootKnock(uint8_t strong, uint8_t weak, unsigned long now)
 	return true;
 }
 
-// Every OUT packet arrives here, on the usbd task. A parser for words carried
-// in rumble packets goes in front of the plain rumble below.
+// Every OUT packet arrives here, on the usbd task. The loop runs the protocol
+// on its word, since the acknowledgement and the relay are loop work.
 static void sc2OnOut(const uint8_t *data, uint32_t length)
 {
 	uint8_t strong, weak;
-	if (g_sc2BootRequest || !sc2RumblePacket(data, length, &strong, &weak))
+	if (!sc2RumblePacket(data, length, &strong, &weak))
 		return;
-	// Boards without the Adafruit bootloader have no UF2 mode, so the
-	// panel's opcode 0x0C is off there too.
-	if (OPK_HAS_ADAFRUIT_DFU && sc2BootKnock(strong, weak, millis())) {
-		g_sc2BootRequest = true;
-		return;
-	}
+	Sc2Word word = { (uint16_t)(strong << 8 | weak), millis() };
 	uint32_t pm = __get_PRIMASK();
 	__disable_irq();
-	g_sc2Usb.rumbleLow = (uint16_t)strong * 257u;
-	g_sc2Usb.rumbleHigh = (uint16_t)weak * 257u;
-	g_sc2Usb.rumblePending = true;
+	uint8_t head = g_sc2Usb.wordHead;
+	uint8_t next = (uint8_t)((head + 1) % SC2_WORD_RING);
+	// A flood is plain rumble, whose newest packet is the one that counts.
+	if (next == g_sc2Usb.wordTail)
+		g_sc2Usb.wordTail =
+			(uint8_t)((g_sc2Usb.wordTail + 1) % SC2_WORD_RING);
+	g_sc2Usb.words[head] = word;
+	g_sc2Usb.wordHead = next;
 	__set_PRIMASK(pm);
+}
+
+static bool sc2NextWord(Sc2Word *word)
+{
+	bool have = false;
+	uint32_t pm = __get_PRIMASK();
+	__disable_irq();
+	if (g_sc2Usb.wordTail != g_sc2Usb.wordHead) {
+		*word = g_sc2Usb.words[g_sc2Usb.wordTail];
+		g_sc2Usb.wordTail =
+			(uint8_t)((g_sc2Usb.wordTail + 1) % SC2_WORD_RING);
+		have = true;
+	}
+	__set_PRIMASK(pm);
+	return have;
 }
 
 static bool sc2Xfer(uint8_t rhport, uint8_t ep, xfer_result_t result,
@@ -465,8 +547,8 @@ static void sc2BuildControls(uint8_t out[SC2_CONTROLS_LEN], const uint8_t *rep,
 	memcpy(out + 16, rep + SC2_REP_TRIGGERS, 4);
 }
 
-// False when the report ends before the pads. The last two fields will carry
-// the output protocol's acknowledgement and stay zero until it exists.
+// False when the report ends before the pads. Leaves the acknowledgement
+// fields at the end alone.
 static bool sc2BuildPads(uint8_t out[SC2_PADS_LEN], const uint8_t *rep,
 			 uint8_t length)
 {
@@ -476,13 +558,35 @@ static bool sc2BuildPads(uint8_t out[SC2_PADS_LEN], const uint8_t *rep,
 	if (length < at + 12)
 		return false;
 	uint32_t buttons = btnsOf(rep);
-	memset(out, 0, SC2_PADS_LEN);
 	memcpy(out, rep + at, 12);
 	// A copy of the touch bits, since frames of different nodes reach a
 	// client in no fixed order and a touch must arrive with its position.
 	out[12] = (uint8_t)(((buttons & TB_LPADT) ? 1 : 0) |
 			    ((buttons & TB_RPADT) ? 2 : 0));
+	out[13] = 0;
 	return true;
+}
+
+// Bits 15 to 8 accepted words mod 256, bit 7 session active, bits 6 to 4
+// payload words still expected (HELLO words outside a session), bits 3 to 0
+// protocol version.
+static uint16_t sc2AckState(const Sc2Session &session)
+{
+	uint8_t expected = 0;
+	if (session.active)
+		expected = session.need;
+	else if (session.hello)
+		expected = (uint8_t)(SC2_HELLO_WORDS - session.hello);
+	return (uint16_t)(session.counter << 8 | (session.active ? 0x80 : 0) |
+			  (expected & 7) << 4 | SC2_PROTOCOL_VERSION);
+}
+
+static void sc2SendPads(void)
+{
+	le16(g_sc2PadsReport + SC2_PADS_ACK_AT, (int16_t)g_sc2Session.echo);
+	le16(g_sc2PadsReport + SC2_PADS_ACK_AT + 2,
+	     (int16_t)sc2AckState(g_sc2Session));
+	usbTxHid(&g_sc2Pads, 0, g_sc2PadsReport, SC2_PADS_LEN);
 }
 
 // False when the report ends before the IMU.
@@ -509,11 +613,11 @@ static void sc2PublishXbox(const uint8_t report[XINPUT_REPORT_LEN])
 static void sc2PublishNeutral(void)
 {
 	uint8_t xbox[XINPUT_REPORT_LEN] = { 0, XINPUT_REPORT_LEN };
-	uint8_t pads[SC2_PADS_LEN] = {};
 	sc2PublishXbox(xbox);
 	memset(g_sc2ControlsReport + 2, 0, SC2_CONTROLS_LEN - 2);
 	usbTxHid(&g_sc2Controls, 0, g_sc2ControlsReport, SC2_CONTROLS_LEN);
-	usbTxHid(&g_sc2Pads, 0, pads, sizeof pads);
+	memset(g_sc2PadsReport, 0, SC2_PADS_ACK_AT);
+	sc2SendPads();
 }
 
 static bool sc2BondRecent(int slot, unsigned long now)
@@ -549,17 +653,351 @@ static void sc2RelayRumble(void)
 {
 	uint32_t pm = __get_PRIMASK();
 	__disable_irq();
-	bool pending = g_sc2Usb.rumblePending, stop = g_sc2Usb.rumbleStop;
-	uint16_t low = g_sc2Usb.rumbleLow, high = g_sc2Usb.rumbleHigh;
-	g_sc2Usb.rumblePending = false;
+	bool stop = g_sc2Usb.rumbleStop;
 	g_sc2Usb.rumbleStop = false;
 	__set_PRIMASK(pm);
+	bool pending = g_sc2PlainPending;
+	g_sc2PlainPending = false;
 	if (g_sc2Bond < 0)
 		return;
 	if (stop)
 		hapticSteamRumble(0, 0, (uint8_t)g_sc2Bond);
 	if (pending)
-		hapticSteamRumble(low, high, (uint8_t)g_sc2Bond);
+		hapticSteamRumble((uint16_t)(g_sc2PlainWord >> 8) * 257u,
+				  (uint16_t)(g_sc2PlainWord & 0xFF) * 257u,
+				  (uint8_t)g_sc2Bond);
+}
+
+static uint8_t sc2Op(uint16_t header)
+{
+	return (uint8_t)(header >> 13);
+}
+
+static uint8_t sc2ControlSub(uint16_t header)
+{
+	return (uint8_t)((header >> 8) & 0x1F);
+}
+
+static int8_t sc2ControlWords(uint16_t header)
+{
+	bool argument = (header & 0xFF) != 0;
+	switch (sc2ControlSub(header)) {
+	case SC2_CTL_NOP:
+	case SC2_CTL_BYE:
+		return argument ? -1 : 0;
+	default:
+		return -1;
+	}
+}
+
+// The payload words that follow a header, or -1 for a header the parser
+// rejects: opcode 7, an undefined CONTROL sub or a non-zero unused bit.
+static int8_t sc2PayloadWords(uint16_t header)
+{
+	switch (sc2Op(header)) {
+	case SC2_OP_CONTROL:
+		return sc2ControlWords(header);
+	case SC2_OP_COMMAND:
+		return 0;
+	case SC2_OP_SCRIPT:
+		return (header & 0x0700) ? -1 : 1;
+	case SC2_OP_RUMBLE:
+		// Bit 0 is a stop: both speeds zero, no payload.
+		if (header & 0x1FFE)
+			return -1;
+		return (header & 1) ? 0 : 2;
+	case SC2_OP_PULSE:
+		return (header & 0x07FF) ? -1 : 3;
+	case SC2_OP_SWEEP:
+		return (header & 0x0700) ? -1 : 3;
+	case SC2_OP_TONE:
+		return (header & 0x0700) ? -1 : 4;
+	default:
+		return -1;
+	}
+}
+
+// A payload field narrower than its word keeps the unused bits zero, like a
+// header, so a word taken out of step is more likely to be caught.
+static bool sc2PayloadValid(uint16_t header, uint8_t index, uint16_t word)
+{
+	switch (sc2Op(header)) {
+	case SC2_OP_SCRIPT:
+		return word <= 0xFF;
+	case SC2_OP_TONE:
+		return index != 3 || word <= 0xFF;
+	default:
+		return true;
+	}
+}
+
+// The controller report for a complete message, report id first, in the
+// layout of SDL's controller_structs.h. Returns its length, 0 for CONTROL.
+static uint8_t sc2BuildReport(uint16_t header, const uint16_t *payload,
+			      uint8_t out[SC2_REPORT_MAX])
+{
+	uint8_t side = (uint8_t)((header >> 11) & 3);
+	uint8_t gain = (uint8_t)(header & 0xFF);
+	switch (sc2Op(header)) {
+	case SC2_OP_COMMAND:
+		out[0] = 0x82;
+		out[1] = side;
+		out[2] = (uint8_t)((header >> 8) & 7);
+		out[3] = gain;
+		return 4;
+	case SC2_OP_SCRIPT:
+		out[0] = 0x85;
+		out[1] = side;
+		out[2] = (uint8_t)payload[0];
+		out[3] = gain;
+		return 4;
+	case SC2_OP_RUMBLE:
+		out[0] = 0x80;
+		if (header & 1)
+			hapticRumbleReport(0, 0, out + 1);
+		else
+			hapticRumbleReport(payload[0], payload[1], out + 1);
+		return 1 + HAPTIC_RUMBLE_LEN;
+	case SC2_OP_PULSE:
+		out[0] = 0x81;
+		out[1] = side;
+		for (uint8_t i = 0; i < 3; i++)
+			le16(out + 2 + 2 * i, (int16_t)payload[i]);
+		return 8;
+	case SC2_OP_SWEEP:
+		out[0] = 0x84;
+		out[1] = side;
+		out[2] = gain;
+		for (uint8_t i = 0; i < 3; i++)
+			le16(out + 3 + 2 * i, (int16_t)payload[i]);
+		return 9;
+	case SC2_OP_TONE:
+		out[0] = 0x83;
+		out[1] = side;
+		out[2] = gain;
+		for (uint8_t i = 0; i < 3; i++)
+			le16(out + 3 + 2 * i, (int16_t)payload[i]);
+		out[9] = (uint8_t)payload[3];
+		return 10;
+	default:
+		return 0;
+	}
+}
+
+// Room in the relay for the largest report, a rumble stop burst. A report the
+// gates will drop needs none.
+static bool sc2RelayRoom(void)
+{
+	return g_sc2Bond < 0 || haptic82Blocked(g_sc2Bond) ||
+	       relayFree((uint8_t)g_sc2Bond) >= RUMBLE_STOP_REPS;
+}
+
+// The last word of a message that queues a report is accepted only while the
+// relay has room, so a full queue holds the client back through the missing
+// acknowledgement instead of evicting queued effects.
+static bool sc2CanComplete(uint16_t header)
+{
+	return sc2Op(header) == SC2_OP_CONTROL || sc2RelayRoom();
+}
+
+// RUMBLE speeds go out verbatim: Steam has shaped them already. The rest is
+// gated like Steam's own reports in the puck mode.
+static bool sc2QueueReport(const uint8_t *report, uint8_t length)
+{
+	Sc2Session &session = g_sc2Session;
+	bool rumble = report[0] == 0x80;
+	if (rumble) {
+		memcpy(session.rumble, report + 1, HAPTIC_RUMBLE_LEN);
+		session.rumbleOn = session.rumble[0] != 0;
+		session.rumbleMs = millis();
+	}
+	if (g_sc2Bond < 0)
+		return false;
+	uint8_t bond = (uint8_t)g_sc2Bond;
+	if (rumble)
+		return hapticRumbleQueue(session.rumble, bond);
+	return !haptic82Blocked(bond) &&
+	       relayEnqueue(report[0], report + 1, (uint8_t)(length - 1), true,
+			    bond);
+}
+
+// Stops the rumble and drops a partial message. Words are plain rumble again.
+static void sc2EndSession(void)
+{
+	Sc2Session &session = g_sc2Session;
+	session.active = false;
+	session.need = 0;
+	session.rumbleOn = false;
+	if (g_sc2Bond < 0)
+		return;
+	uint8_t stop[HAPTIC_RUMBLE_LEN];
+	hapticRumbleReport(0, 0, stop);
+	hapticRumbleQueue(stop, (uint8_t)g_sc2Bond);
+}
+
+static void sc2StartSession(unsigned long ms)
+{
+	Sc2Session &session = g_sc2Session;
+	// A plain rumble that came before the HELLO still goes out first.
+	sc2RelayRumble();
+	session.active = true;
+	session.hello = 0;
+	session.need = 0;
+	session.rumbleOn = false;
+	session.wordMs = ms;
+}
+
+// A complete message. Returns what ACK_ECHO shows for it.
+static uint16_t sc2Run(uint16_t last)
+{
+	Sc2Session &session = g_sc2Session;
+	if (sc2Op(session.header) == SC2_OP_CONTROL) {
+		if (sc2ControlSub(session.header) == SC2_CTL_BYE)
+			sc2EndSession();
+		return last;
+	}
+	uint8_t report[SC2_REPORT_MAX];
+	uint8_t length =
+		sc2BuildReport(session.header, session.payload, report);
+	sc2QueueReport(report, length);
+	return last;
+}
+
+// Each accepted word sends a pads report: the counter is how a client tells
+// this word's acknowledgement from the previous one.
+static void sc2Accept(uint16_t echo)
+{
+	g_sc2Session.counter++;
+	g_sc2Session.echo = echo;
+	sc2SendPads();
+}
+
+// Four HELLO words in a row outside a session, each within the session
+// timeout of the one before, start one. True for a HELLO word, which is
+// taken instead of relayed.
+static bool sc2HelloStep(uint16_t word, unsigned long ms)
+{
+	Sc2Session &session = g_sc2Session;
+	if (session.hello && ms - session.helloMs > SC2_SESSION_MS)
+		session.hello = 0;
+	if (word != SC2_HELLO[session.hello])
+		session.hello = 0;
+	if (word != SC2_HELLO[session.hello])
+		return false;
+	session.hello++;
+	session.helloMs = ms;
+	return true;
+}
+
+// Boards without the Adafruit bootloader have no UF2 mode, so the panel's
+// opcode 0x0C is off there too.
+static bool sc2KnockWord(uint16_t word, unsigned long ms)
+{
+	return OPK_HAS_ADAFRUIT_DFU &&
+	       sc2BootKnock((uint8_t)(word >> 8), (uint8_t)word, ms);
+}
+
+// A word the parser cannot take ends the session, so a client that lost
+// count starts over with a HELLO. The word still counts as accepted, which
+// tells the client at once, and it is then a word outside the session: it
+// can be a knock step or the first word of a new HELLO, never rumble.
+static void sc2Reject(uint16_t word, unsigned long ms)
+{
+	sc2EndSession();
+	if (sc2KnockWord(word, ms))
+		g_sc2BootRequest = true;
+	else
+		sc2HelloStep(word, ms);
+	sc2Accept(word);
+}
+
+static void sc2PayloadWord(uint16_t word, unsigned long ms)
+{
+	Sc2Session &session = g_sc2Session;
+	if (!sc2PayloadValid(session.header, session.have, word)) {
+		sc2Reject(word, ms);
+		return;
+	}
+	if (session.need == 1 && !sc2CanComplete(session.header))
+		return;
+	session.payload[session.have++] = word;
+	uint16_t echo = word;
+	if (!--session.need)
+		echo = sc2Run(word);
+	sc2Accept(echo);
+}
+
+static void sc2SessionWord(uint16_t word, unsigned long ms)
+{
+	Sc2Session &session = g_sc2Session;
+	if (session.need) {
+		sc2PayloadWord(word, ms);
+		return;
+	}
+	int8_t need = sc2PayloadWords(word);
+	if (need < 0) {
+		sc2Reject(word, ms);
+		return;
+	}
+	if (!need && !sc2CanComplete(word))
+		return;
+	session.header = word;
+	session.have = 0;
+	session.need = (uint8_t)need;
+	uint16_t echo = word;
+	if (!need)
+		echo = sc2Run(word);
+	sc2Accept(echo);
+}
+
+static void sc2OnWord(uint16_t word, unsigned long ms)
+{
+	Sc2Session &session = g_sc2Session;
+	if (g_sc2BootRequest)
+		return;
+	if (session.active) {
+		session.wordMs = ms;
+		sc2SessionWord(word, ms);
+		return;
+	}
+	if (sc2KnockWord(word, ms)) {
+		g_sc2BootRequest = true;
+		return;
+	}
+	if (sc2HelloStep(word, ms)) {
+		if (session.hello == SC2_HELLO_WORDS)
+			sc2StartSession(ms);
+		sc2Accept(word);
+		return;
+	}
+	g_sc2PlainWord = word;
+	g_sc2PlainPending = true;
+}
+
+static void sc2DrainWords(void)
+{
+	Sc2Word word;
+	for (uint8_t i = 0; i < SC2_WORD_RING && sc2NextWord(&word); i++)
+		sc2OnWord(word.value, word.ms);
+}
+
+// The timeout ends the session of a client that crashed or left without BYE.
+static void sc2SessionTask(void)
+{
+	Sc2Session &session = g_sc2Session;
+	if (!session.active)
+		return;
+	unsigned long now = millis();
+	if (now - session.wordMs > SC2_SESSION_MS) {
+		sc2EndSession();
+		sc2SendPads();
+		return;
+	}
+	if (!session.rumbleOn || g_sc2Bond < 0 ||
+	    now - session.rumbleMs < SC2_RUMBLE_RESEND_MS || !sc2RelayRoom())
+		return;
+	session.rumbleMs = now;
+	hapticRumbleQueue(session.rumble, (uint8_t)g_sc2Bond);
 }
 
 // Stops the rumble the knock's first packets started, then reboots the way the
@@ -627,6 +1065,9 @@ void SC2LinkController::begin()
 	sc2BeginNode(g_sc2Pads, SC2_PADS_DESC, sizeof SC2_PADS_DESC);
 	sc2BeginNode(g_sc2Motion, SC2_MOTION_DESC, sizeof SC2_MOTION_DESC);
 	usbTxRegisterDrain(sc2XboxDrain);
+	// The protocol version reads 1 from the first frame, with or without a
+	// controller.
+	sc2SendPads();
 }
 
 void SC2LinkController::onReport45(int slot, const uint8_t *rep, bool fresh,
@@ -640,9 +1081,9 @@ void SC2LinkController::onReport45(int slot, const uint8_t *rep, bool fresh,
 	sc2BuildControls(g_sc2ControlsReport, rep, g_sc2Counter,
 			 sc2Status(g_sc2Battery));
 	usbTxHid(&g_sc2Controls, 0, g_sc2ControlsReport, SC2_CONTROLS_LEN);
-	uint8_t pads[SC2_PADS_LEN], motion[SC2_MOTION_LEN];
-	if (sc2BuildPads(pads, rep, bodyTlen))
-		usbTxHid(&g_sc2Pads, 0, pads, sizeof pads);
+	uint8_t motion[SC2_MOTION_LEN];
+	if (sc2BuildPads(g_sc2PadsReport, rep, bodyTlen))
+		sc2SendPads();
 	if (sc2BuildMotion(motion, rep, bodyTlen))
 		usbTxHid(&g_sc2Motion, 0, motion, sizeof motion);
 	uint8_t xbox[XINPUT_REPORT_LEN];
@@ -667,6 +1108,8 @@ void SC2LinkController::onAuxReport(int slot, uint8_t rid, const uint8_t *data,
 void SC2LinkController::task()
 {
 	sc2UpdateBond();
+	sc2DrainWords();
+	sc2SessionTask();
 	sc2RelayRumble();
 	sc2BootTask();
 }
