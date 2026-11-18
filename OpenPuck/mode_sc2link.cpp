@@ -309,6 +309,11 @@ struct Sc2Session {
 	uint8_t have, need;
 	// The toggle of the last word taken in the session.
 	uint8_t toggle;
+	// The word that ended the last session, BYE or a rejected word, and
+	// when, until another word arrives.
+	bool ended;
+	uint16_t endWord;
+	unsigned long endMs;
 	// ACK_STATE's counter of accepted words, and ACK_ECHO.
 	uint8_t counter;
 	uint16_t echo;
@@ -1068,12 +1073,17 @@ static void sc2SessionWord(uint16_t word, unsigned long ms)
 // One upload and play can reach the dongle twice when an ff-memless timer
 // tick falls between the two, and a client resends a word whose
 // acknowledgement was slow. Such a copy is not taken again: in a session it
-// carries the last toggle, outside it repeats the last HELLO word matched.
+// carries the last toggle, outside it repeats the word that ended the session
+// or the last HELLO word matched. Taken as plain rumble, a copy of BYE with
+// toggle 1, 0x8200, would drive the left motor at 0x82 of 0xFF.
 static bool sc2Copy(uint16_t word, unsigned long ms)
 {
 	const Sc2Session &session = g_sc2Session;
 	if (session.active)
 		return (word >> SC2_TOGGLE_SHIFT) == session.toggle;
+	if (session.ended && word == session.endWord &&
+	    ms - session.endMs <= SC2_SESSION_MS)
+		return true;
 	return session.hello && word == SC2_HELLO[session.hello - 1] &&
 	       ms - session.helloMs <= SC2_SESSION_MS;
 }
@@ -1092,8 +1102,18 @@ static void sc2OnWord(uint16_t word, unsigned long ms)
 	}
 	if (session.active) {
 		sc2SessionWord(word, ms);
+		// A rejected word met the knock and HELLO once, in sc2Reject.
+		// Its copies, like those of BYE, meet nothing.
+		if (!session.active) {
+			session.ended = true;
+			session.endWord = word;
+			session.endMs = ms;
+		}
 		return;
 	}
+	// After another word, a repeat of the word that ended the session is no
+	// copy.
+	session.ended = false;
 	if (sc2KnockWord(word, ms)) {
 		g_sc2Reboot = SC2_REBOOT_UF2;
 		return;

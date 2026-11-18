@@ -270,6 +270,39 @@ class Copies(unittest.TestCase):
         self.assertEqual(model.counter, 4)
         self.assertTrue(model.active)
 
+    def assert_end_word_copied(self, data_words, end_word):
+        model = session_model()
+        outcomes = send(model, data_words)
+        self.assertEqual(outcomes[-1].echo, end_word)
+        self.assertFalse(model.active)
+        counter, state = model.counter, model.state()
+        copy = model.word(end_word)
+        self.assertTrue(copy.copy)
+        self.assertEqual((model.counter, copy.state), (counter, state))
+        # After another word the same word is plain rumble again.
+        self.assertFalse(model.word(0x1010).accepted)
+        repeat = model.word(end_word)
+        self.assertFalse(repeat.accepted or repeat.copy)
+
+    def test_bye_twice_at_both_toggles(self):
+        # 0x8200 as plain rumble drives the left motor at 0x82.
+        self.assert_end_word_copied([sc2.BYE], 0x8200)
+        self.assert_end_word_copied([sc2.NOP, sc2.BYE], 0x0200)
+
+    def test_rejected_word_twice(self):
+        self.assert_end_word_copied([0x3800], 0xB800)
+        self.assert_end_word_copied([sc2.NOP, 0x3800], 0x3800)
+
+    def test_rejected_hello_word_twice(self):
+        # A rejected first HELLO word starts a HELLO, and its copy is a copy
+        # under both rules.
+        model = session_model()
+        send(model, [sc2.NOP])
+        self.assertTrue(model.word(sc2.HELLO[0]).accepted)
+        self.assertTrue(model.word(sc2.HELLO[0]).copy)
+        run(model, sc2.HELLO[1:])
+        self.assertTrue(model.active)
+
 
 class Framing(unittest.TestCase):
     def assert_rejected(self, data_words):

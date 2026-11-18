@@ -511,9 +511,10 @@ out.
 **Copies.** A word can reach the dongle twice: ff-memless sends one upload and play as two packets when a timer
 tick falls between the two calls, and a resend repeats a word the dongle had already taken. In a session the
 toggle tells them apart: the HELLO words have toggle 0, the first session word carries 1, and each new word
-flips it. A word with the toggle of the last word taken is a copy. Outside a session a repeat of the HELLO word
-matched last, within 500 ms, is a copy. A copy is not taken: the counter stays and the dongle sends its
-acknowledgement again, which is identical, so evdev shows no new frame.
+flips it. A word with the toggle of the last word taken is a copy. Outside a session two repeats are copies,
+each within 500 ms and before any other word: of the word that ended the session (BYE or a rejected word) and of
+the HELLO word matched last. A copy is not taken, relayed as rumble or checked as a knock or HELLO step: the
+counter stays and the dongle sends its acknowledgement again, which is identical, so evdev shows no new frame.
 
 **Session.**
 

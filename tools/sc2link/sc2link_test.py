@@ -485,6 +485,9 @@ class Model:
         self.payload = []
         self.need = 0
         self.toggle = 0
+        # The word that ended the last session, BYE or a rejected one,
+        # until another word arrives.
+        self.end_word = None
         self.echo = 0
         self.queued = b""
         self.reboot = None
@@ -503,15 +506,22 @@ class Model:
     def word(self, word):
         if self._copy(word):
             return Outcome(False, self.echo, self.state(), copy=True)
-        if not self.active:
-            if not self._hello_step(word):
-                return Outcome(False)
-            if self.hello == len(HELLO):
-                self.active = True
-                self.hello = 0
-                self.need = 0
-                self.toggle = HELLO[-1] >> TOGGLE_SHIFT
-            return self._accept(word)
+        if self.active:
+            outcome = self._session_word(word)
+            if not self.active:
+                self.end_word = word
+            return outcome
+        self.end_word = None
+        if not self._hello_step(word):
+            return Outcome(False)
+        if self.hello == len(HELLO):
+            self.active = True
+            self.hello = 0
+            self.need = 0
+            self.toggle = HELLO[-1] >> TOGGLE_SHIFT
+        return self._accept(word)
+
+    def _session_word(self, word):
         if self.need:
             return self._payload(word)
         need = payload_words(word & DATA)
@@ -524,6 +534,8 @@ class Model:
     def _copy(self, word):
         if self.active:
             return word >> TOGGLE_SHIFT == self.toggle
+        if word == self.end_word:
+            return True
         return bool(self.hello) and word == HELLO[self.hello - 1]
 
     def _hello_step(self, word):
@@ -1409,6 +1421,16 @@ def selftest_copies(test):
             data_words += encode_rumble_stop()
         test.case(f"{message.name} with every word sent twice",
                   doubled(test.stamp(data_words)))
+    # BYE with toggle 1 is 0x8200, as plain rumble 0x82 on the left motor.
+    # A copy and plain rumble look the same on the pads node.
+    data_words = [NOP, BYE] if test.toggle else [BYE]
+    words = test.stamp(data_words)
+    test.case("BYE with toggle 1 sent twice",
+              words[:-1] + doubled(words[-1:]))
+    if test.model.linked:
+        print("CHECK by hand: no rumble after the doubled BYE.")
+    test.hello("HELLO after it opens a new session")
+    test.case("a rejected word sent twice", doubled(test.stamp([header(7)])))
     test.link.quiet(SILENCE_S)
     test.link.acks.refresh()
     test.model.end_session()
