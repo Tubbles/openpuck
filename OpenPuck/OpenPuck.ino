@@ -43,6 +43,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #include "fault_diag.h"
 #include "fw_update.h"
 #include "usb_tx.h"
+#include "mode_sc2link.h" // OPK_SC2LINK_FORCE
 #include <stdio.h>
 
 #if CFG_TUD_HID < 4
@@ -151,6 +152,11 @@ void setup()
 	factoryResetOnce(OPK_GIT_HASH);
 #endif
 	loadCfg();
+#if OPK_SC2LINK_FORCE
+	// In memory only: cfg.bin keeps its mode until something else saves it.
+	g_usbMode = MODE_SC2LINK;
+	applyActiveType();
+#endif
 	rfApplyStartupLastGoodChannel();
 	loadBonds();
 	// Lizard (desktop) keyboard/mouse binding table. Custom remapping applies ONLY in pure

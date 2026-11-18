@@ -4,6 +4,13 @@
 #pragma once
 #include "controllers.h"
 
+// Test builds: boot into SC2 Link whatever cfg.bin holds, so a freshly flashed
+// dongle needs no configuration step. Leaving the mode then takes a build
+// without it. -DOPK_SC2LINK_FORCE=1 to enable.
+#ifndef OPK_SC2LINK_FORCE
+#define OPK_SC2LINK_FORCE 0
+#endif
+
 class SC2LinkController : public IController {
     public:
 	void begin() override;
