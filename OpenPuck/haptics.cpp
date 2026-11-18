@@ -657,7 +657,7 @@ static bool modeWantsImu(uint8_t m)
 {
 	return m == MODE_SW_PRO || m == MODE_PS5 || m == MODE_PS5_GAME ||
 	       m == MODE_HIDGYRO || m == MODE_DS4_GAME || m == MODE_PS3 ||
-	       m == MODE_DINPUT || m == MODE_SINPUT;
+	       m == MODE_DINPUT || m == MODE_SINPUT || m == MODE_SC2LINK;
 }
 // Steam can leave the controller's persisted IMU mode off, and it survives across pucks. Every emulated
 // gyro mode needs the raw RF samples that setting suppresses, so write raw accel + gyro for this slot.
@@ -788,7 +788,11 @@ void hapticTask()
 		// left id9=0, and the trackpad ticks stay silent.
 		const bool pureLizard = (g_usbMode == MODE_LIZARD);
 		if (!modeIsPuck(g_usbMode) || pureLizard) {
-			bool wantAuto = pureLizard || (g_padHaptics != 0);
+			// SC2 Link holds the pad layer off: its client gets
+			// raw pads, and pad haptics are the host's to make.
+			bool wantAuto = pureLizard ||
+					(g_padHaptics != 0 &&
+					 g_usbMode != MODE_SC2LINK);
 			for (int s = 0; s < NSLOT; s++) {
 				if (!g_slot[s].used || !hapticLinkUp(s)) {
 					// re-land id9 on the next (re)connect: a fresh controller defaults to
