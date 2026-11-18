@@ -9,7 +9,9 @@ import io
 import os
 import struct
 import sys
+import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -411,6 +413,104 @@ class Client(unittest.TestCase):
         acks = self.run_client(link, [sc2.BYE])
         self.assertEqual(len(acks[0]), 1)
         self.assertEqual(len(link.sent), 5)
+
+
+class ModelAcks:
+    def __init__(self, dongle):
+        self.dongle = dongle
+
+    @property
+    def state(self):
+        return self.dongle.state()
+
+    @property
+    def echo(self):
+        return self.dongle.echo
+
+    def counter(self):
+        return self.dongle.counter
+
+    def refresh(self):
+        pass
+
+
+class ModelLink:
+    """Link with the Model as the dongle, for whole subcommands."""
+
+    linked = True
+
+    def __init__(self, dongle_nodes):
+        self.dongle = sc2.Model(counter=200, linked=self.linked)
+        self.acks = ModelAcks(self.dongle)
+        self.round_trips_ns = []
+        self.resends = 0
+
+    def close(self):
+        pass
+
+    def state(self):
+        return self.dongle.state()
+
+    def quiet(self, seconds):
+        if seconds >= sc2.SESSION_TIMEOUT_S:
+            if self.dongle.active:
+                self.dongle.end_session()
+            self.dongle.hello = 0
+
+    def send(self, word, in_session=False):
+        outcome = self.dongle.word(word)
+        if not outcome.accepted:
+            return None
+        self.round_trips_ns.append(1000000)
+        return sc2.Ack(word, outcome.echo, outcome.state, 1000000, 0, 1)
+
+    def send_plain(self, word, listen_s=0.1):
+        return not self.dongle.word(word).accepted
+
+    def gone(self, seconds):
+        return self.dongle.reboot is not None
+
+
+class Subcommands(unittest.TestCase):
+    """Each subcommand from argv to exit code, the Model as the dongle."""
+
+    def run_main(self, *argv, linked=True):
+        nodes = types.SimpleNamespace(
+            prefix="usb-test", xpad=types.SimpleNamespace(path="/x"),
+            pads=types.SimpleNamespace(path="/p"))
+        link = type("Link", (ModelLink,), {"linked": linked})
+        output = io.StringIO()
+        with mock.patch.object(sc2, "choose_dongle", return_value=nodes), \
+                mock.patch.object(sc2, "controller_linked",
+                                  return_value=linked), \
+                mock.patch.object(sc2, "Link", link), \
+                mock.patch.object(sc2.time, "sleep"), \
+                contextlib.redirect_stdout(output):
+            code = sc2.main(list(argv))
+        return code, output.getvalue()
+
+    def test_selftest_passes(self):
+        for linked in (True, False):
+            code, output = self.run_main("selftest", linked=linked)
+            self.assertEqual(code, 0, output)
+            self.assertNotIn("FAIL", output)
+            self.assertEqual("CHECK by hand" in output, linked)
+
+    def test_send_every_message(self):
+        for message in sc2.MESSAGES.values():
+            values = [str(field.maximum) for field in message.fields]
+            code, output = self.run_main("send", message.name, *values)
+            self.assertEqual(code, 0, output)
+            self.assertIn(" match", output)
+        code, output = self.run_main("send", "rumble", "stop")
+        self.assertEqual(code, 0, output)
+
+    def test_session_commands(self):
+        for argv in (["hello"], ["bye"], ["bootloader"], ["mode", "13"]):
+            code, output = self.run_main(*argv)
+            self.assertEqual(code, 0, output)
+        code, output = self.run_main("mode", "14")
+        self.assertEqual(code, 1, output)
 
 
 class Discovery(unittest.TestCase):
