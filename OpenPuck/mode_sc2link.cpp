@@ -14,6 +14,7 @@
 #include "fault_diag.h"
 #include "usb_tx.h"
 #include "usb_app_drivers.h"
+#include "usb_mount.h" // modeSwitchReboot()
 #include <Adafruit_TinyUSB.h>
 #include <Arduino.h>
 #include <string.h>
@@ -62,6 +63,13 @@ enum Sc2Op {
 // CONTROL subs, header bits 12 to 8.
 #define SC2_CTL_NOP 0x00
 #define SC2_CTL_BYE 0x02
+#define SC2_CTL_BOOTLOADER 0x05
+#define SC2_CTL_MODE 0x06
+// The commands that reboot take effect only with this payload word, so a
+// client that lost count does not reboot the dongle with one stray word.
+#define SC2_BOOT_CONFIRM 0x5546
+// ORed with the mode number from the header.
+#define SC2_MODE_CONFIRM 0x4D00
 
 // Each is an undefined CONTROL header, so no message starts with one, and a
 // HELLO sent inside a session at a message boundary restarts the session.
@@ -376,7 +384,8 @@ static bool sc2RumblePacket(const uint8_t *data, uint32_t length,
 // A host that reaches the pad only through its event node (a TV app, a desktop
 // user without usbfs access) has no panel. For it, four rumble packets in a
 // row outside a session, each within 500 ms of the one before, reboot into
-// the UF2 bootloader. The first three still rumble.
+// the UF2 bootloader. The first three still rumble. Inside a session the
+// BOOTLOADER command does the same.
 static const uint8_t SC2_BOOT_KNOCK[][2] = {
 	{ 0x55, 0x46 },
 	{ 0x32, 0xB0 },
@@ -389,8 +398,10 @@ static const uint8_t SC2_BOOT_KNOCK_STEPS =
 // Long enough for the rumble stop burst to leave on the following RF polls.
 #define SC2_BOOT_DELAY_MS 50u
 
-// Loop only.
-static bool g_sc2BootRequest;
+// Loop only: SC2_REBOOT_NONE, SC2_REBOOT_UF2 or the mode to reboot into.
+#define SC2_REBOOT_NONE 0xFF
+#define SC2_REBOOT_UF2 0xFE
+static uint8_t g_sc2Reboot = SC2_REBOOT_NONE;
 
 static bool sc2KnockStep(uint8_t step, uint8_t strong, uint8_t weak)
 {
@@ -680,11 +691,16 @@ static uint8_t sc2ControlSub(uint16_t header)
 
 static int8_t sc2ControlWords(uint16_t header)
 {
-	bool argument = (header & 0xFF) != 0;
+	uint8_t argument = (uint8_t)header;
 	switch (sc2ControlSub(header)) {
 	case SC2_CTL_NOP:
 	case SC2_CTL_BYE:
 		return argument ? -1 : 0;
+	case SC2_CTL_BOOTLOADER:
+		// No UF2 mode without the Adafruit bootloader.
+		return (argument || !OPK_HAS_ADAFRUIT_DFU) ? -1 : 1;
+	case SC2_CTL_MODE:
+		return modeValid(argument) ? 1 : -1;
 	default:
 		return -1;
 	}
@@ -718,10 +734,15 @@ static int8_t sc2PayloadWords(uint16_t header)
 }
 
 // A payload field narrower than its word keeps the unused bits zero, like a
-// header, so a word taken out of step is more likely to be caught.
+// header, so a word taken out of step is more likely to be caught. A command
+// that reboots takes only its confirmation word.
 static bool sc2PayloadValid(uint16_t header, uint8_t index, uint16_t word)
 {
 	switch (sc2Op(header)) {
+	case SC2_OP_CONTROL:
+		if (sc2ControlSub(header) == SC2_CTL_MODE)
+			return word == (SC2_MODE_CONFIRM | (header & 0xFF));
+		return word == SC2_BOOT_CONFIRM;
 	case SC2_OP_SCRIPT:
 		return word <= 0xFF;
 	case SC2_OP_TONE:
@@ -852,8 +873,13 @@ static uint16_t sc2Run(uint16_t last)
 {
 	Sc2Session &session = g_sc2Session;
 	if (sc2Op(session.header) == SC2_OP_CONTROL) {
-		if (sc2ControlSub(session.header) == SC2_CTL_BYE)
+		uint8_t sub = sc2ControlSub(session.header);
+		if (sub == SC2_CTL_BYE)
 			sc2EndSession();
+		else if (sub == SC2_CTL_BOOTLOADER)
+			g_sc2Reboot = SC2_REBOOT_UF2;
+		else if (sub == SC2_CTL_MODE)
+			g_sc2Reboot = (uint8_t)session.header;
 		return last;
 	}
 	uint8_t report[SC2_REPORT_MAX];
@@ -905,7 +931,7 @@ static void sc2Reject(uint16_t word, unsigned long ms)
 {
 	sc2EndSession();
 	if (sc2KnockWord(word, ms))
-		g_sc2BootRequest = true;
+		g_sc2Reboot = SC2_REBOOT_UF2;
 	else
 		sc2HelloStep(word, ms);
 	sc2Accept(word);
@@ -953,7 +979,7 @@ static void sc2SessionWord(uint16_t word, unsigned long ms)
 static void sc2OnWord(uint16_t word, unsigned long ms)
 {
 	Sc2Session &session = g_sc2Session;
-	if (g_sc2BootRequest)
+	if (g_sc2Reboot != SC2_REBOOT_NONE)
 		return;
 	if (session.active) {
 		session.wordMs = ms;
@@ -961,7 +987,7 @@ static void sc2OnWord(uint16_t word, unsigned long ms)
 		return;
 	}
 	if (sc2KnockWord(word, ms)) {
-		g_sc2BootRequest = true;
+		g_sc2Reboot = SC2_REBOOT_UF2;
 		return;
 	}
 	if (sc2HelloStep(word, ms)) {
@@ -1000,25 +1026,29 @@ static void sc2SessionTask(void)
 	hapticRumbleQueue(session.rumble, (uint8_t)g_sc2Bond);
 }
 
-// Stops the rumble the knock's first packets started, then reboots the way the
-// panel's opcode 0x0C does.
-static void sc2BootTask(void)
+// Stops the rumble a knock or a session started, then reboots the way the
+// panel does: opcode 0x0C into the UF2 bootloader, opcode 0x03 into a mode.
+static void sc2RebootTask(void)
 {
 	static bool stopped;
 	static unsigned long stopMs;
-	if (!g_sc2BootRequest)
+	if (g_sc2Reboot == SC2_REBOOT_NONE)
 		return;
 	if (!stopped) {
 		stopped = true;
 		stopMs = millis();
-		if (g_sc2Bond >= 0)
-			hapticSteamRumble(0, 0, (uint8_t)g_sc2Bond);
+		// Ending the session too keeps its rumble from being resent.
+		sc2EndSession();
 		return;
 	}
 	if (millis() - stopMs < SC2_BOOT_DELAY_MS)
 		return;
-	faultDiagArmIntentionalReset();
-	enterUf2Dfu();
+	if (g_sc2Reboot == SC2_REBOOT_UF2) {
+		faultDiagArmIntentionalReset();
+		enterUf2Dfu();
+	} else {
+		modeSwitchReboot(g_sc2Reboot);
+	}
 }
 
 static bool sc2StateReport(const uint8_t *rep, uint8_t length)
@@ -1111,5 +1141,5 @@ void SC2LinkController::task()
 	sc2DrainWords();
 	sc2SessionTask();
 	sc2RelayRumble();
-	sc2BootTask();
+	sc2RebootTask();
 }
