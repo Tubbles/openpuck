@@ -9,6 +9,10 @@ numbers follow the generic Linux encoding used on x86 and ARM.
 
 A session ends 500 ms after the last word, so every command that needs one
 opens its own after 600 ms of silence.
+
+check walks a person through every input, the motion sensors and the haptics
+of the linked controller and writes a report; sc2link_check.py beside this
+file holds it and its documentation.
 """
 
 import argparse
@@ -1570,6 +1574,12 @@ def command_selftest(args):
     return with_client(args, body)
 
 
+def command_check(args):
+    # Imported here: sc2link_check imports this module.
+    import sc2link_check
+    return sc2link_check.command_check(args)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -1609,6 +1619,13 @@ def build_parser():
     commands.add_parser("knock", help="reboot into the UF2 bootloader with "
                         "the out-of-session knock").set_defaults(
         handler=command_knock)
+    check = commands.add_parser(
+        "check", help="interactive check of the controller's inputs, motion "
+        "sensors and haptics, with a report")
+    check.add_argument("--report", metavar="STEM", help="write STEM.json and "
+                       "STEM.txt (default sc2link-check-<UTC time> in the "
+                       "working directory)")
+    check.set_defaults(handler=command_check)
     return parser
 
 

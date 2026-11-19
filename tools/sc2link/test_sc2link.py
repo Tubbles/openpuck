@@ -572,9 +572,11 @@ CLICK_S = 0.024
 # 3 s, no stop. Other ids play nothing.
 SCRIPT_IDS = range(1, 17)
 SCRIPT_S = 3.0
-# The dongle refreshes a rumble until the next 0x80 or session edge, and the
-# controller plays each 0x80 for 100 ms (sc26re).
+# The dongle refreshes a rumble every 40 ms until the next 0x80 or session
+# edge (docs/PROTOCOL.md 9.5.1), and the controller plays each 0x80 for
+# 100 ms (sc26re).
 RUMBLE_HOLD_S = 0.1
+RUMBLE_REFRESH_S = 0.040
 
 
 def effect_seconds(report):
@@ -623,6 +625,38 @@ class Effects(unittest.TestCase):
                          math.inf)
         self.assertEqual(effect_seconds(sc2.report_script(0, 5, -128)),
                          SCRIPT_S)
+
+    def test_check_effects_end_within_a_second(self):
+        # Every report the check can send, from its own messages: a rumble
+        # lasts until its stop. When the dongle never takes the stop, Link
+        # resends it MAX_RESENDS times, each refreshing the session timer,
+        # and the session times out after the last; the last refresh before
+        # that stop plays on. test_sc2link_check.py also runs the whole
+        # check against the Model and applies effects() to what it relayed.
+        lost_stop_s = ((sc2.MAX_RESENDS + 1) * sc2.RESEND_AFTER_S
+                       + sc2.SESSION_TIMEOUT_S + RUMBLE_REFRESH_S
+                       + RUMBLE_HOLD_S)
+        import sc2link_check as check
+        effects_of_check = [effect for effect, _ in check.LOCATE_EFFECTS]
+        effects_of_check += [*check.MEASURED_EFFECTS, check.STOP_TRAIN]
+        messages = [(effect.key, words, effect.stop_after_s)
+                    for effect in effects_of_check
+                    for words in effect.messages]
+        messages += [(candidate.key, words, 0.0)
+                     for candidate in check.STOP_CANDIDATES
+                     for words in candidate.messages]
+        self.assertGreater(len(messages), 30)
+        for key, words, stop_after_s in messages:
+            report = sc2.build_report(words[0], list(words[1:]))
+            if report is None:
+                continue
+            with self.subTest(key=key, report=report.hex(" ")):
+                if report[0] == 0x80:
+                    seconds = (stop_after_s + lost_stop_s) if report[1] \
+                        else 0.0
+                else:
+                    seconds = effect_seconds(report)
+                self.assertLessEqual(seconds, 1.0)
 
     def test_rumble_lasts_until_the_next(self):
         on, off = sc2.report_rumble(1, 0), sc2.report_rumble(0, 0)
@@ -711,8 +745,10 @@ class CommandLine(unittest.TestCase):
         self.assertEqual((args.phys, args.message, args.hold),
                          ("usb-x", "tone", 1.0))
         self.assertEqual(args.fields, ["3", "-6", "160", "500", "0", "0"])
-        for command in ("hello", "bye", "selftest", "bootloader", "knock"):
+        for command in ("hello", "bye", "selftest", "bootloader", "knock",
+                        "check"):
             self.assertEqual(self.parse(command).command, command)
+        self.assertEqual(self.parse("check", "--report", "out").report, "out")
 
     def test_errors(self):
         with self.assertRaises(SystemExit):
