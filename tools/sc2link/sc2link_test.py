@@ -363,9 +363,9 @@ def word_field(name):
 
 
 # The side byte names other actuators per report (docs/PROTOCOL.md 9.5.1).
-# Pulse: 0 right pad, 1 left pad, 2 both pads, 3 to 5 unmeasured. The others:
-# 0 left pad, 1 right pad, 2 both pads, 3 left grip actuator, 4 right grip
-# actuator, 5 both grip actuators. The dongle rejects 6 and 7.
+# Pulse: 0 right pad, 1 left pad, 2 both pads, 3 to 5 as the others. The
+# others: 0 left pad, 1 right pad, 2 both pads, 3 left grip actuator, 4 right
+# grip actuator, 5 both grip actuators. The dongle rejects 6 and 7.
 SIDE_MAX = 5
 SIDE = Field("side", 0, SIDE_MAX)
 GAIN = Field("gain", -128, 127)
@@ -1753,8 +1753,8 @@ def build_parser():
             f"{message.name} " + " ".join(field.name.upper()
                                           for field in message.fields)
             for message in MESSAGES.values()) + "; rumble stop. SIDE of a "
-        "pulse: 0 right pad, 1 left pad, 2 both pads, 3 to 5 unmeasured. Of "
-        "the others: 0 left pad, 1 right pad, 2 both pads, 3 left grip "
+        "pulse: 0 right pad, 1 left pad, 2 both pads, 3 to 5 as the others. "
+        "Of the others: 0 left pad, 1 right pad, 2 both pads, 3 left grip "
         "actuator, 4 right grip actuator, 5 both grip actuators.")
     send.add_argument("message", choices=sorted(MESSAGES))
     send.add_argument("fields", nargs="*", help="field values, 0x for hex")

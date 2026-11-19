@@ -579,7 +579,8 @@ Gains are s8 dB. Report fields are little-endian. `side`, header bits 10..8, nam
 report:
 
 - `0x81`: 0 right pad, 1 left pad, 2 both pads (Linux `drivers/hid/hid-steam.c`: "Left and right are swapped on
-  this report for legacy reasons"). 3 to 5 are unmeasured; mwdmwd/sc26re reads them as for `0x82` to `0x85`.
+  this report for legacy reasons"). 3 to 5 are the grip actuators as for `0x82` to `0x85` (felt on a
+  controller, 2026-11-19).
 - `0x82` to `0x85`: 0 left pad, 1 right pad, 2 both pads, 3 left grip actuator, 4 right grip actuator, 5 both
   grip actuators. 0 to 3 were felt on a controller (3 with a tone), 4 and 5 follow mwdmwd/sc26re, which
   reconstructs the stock firmware.
