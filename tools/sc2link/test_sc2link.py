@@ -51,7 +51,7 @@ def session_model(linked=True):
     return model
 
 
-# The stop reports by report id and side: "81 02", "82 02", "81 05", "82 05".
+# The stop reports by report id and side: "82 02", "82 05".
 STOP = {report[:2].hex(" "): report for _, report in sc2.STOP_ENTRIES}
 
 
@@ -257,10 +257,10 @@ class Stop(unittest.TestCase):
     }
     # The stop reports each class sends.
     SENDS = {
-        sc2.PAD_PULSE: ["81 02", "82 02"],
-        sc2.GRIP_PULSE: ["81 05", "82 05"],
-        sc2.PAD_TONE: ["81 02", "82 02"],
-        sc2.GRIP_TONE: ["81 05", "82 05"],
+        sc2.PAD_PULSE: ["82 02"],
+        sc2.GRIP_PULSE: ["82 05"],
+        sc2.PAD_TONE: ["82 02"],
+        sc2.GRIP_TONE: ["82 05"],
     }
     ENDS = {"BYE": lambda model: send(model, [sc2.BYE]),
             "a rejected word": lambda model: send(model, [0x3800]),
@@ -311,9 +311,7 @@ class Stop(unittest.TestCase):
     def test_entries(self):
         self.assertEqual([(classes, report.hex(" "))
                           for classes, report in sc2.STOP_ENTRIES], [
-            (sc2.PAD_PULSE | sc2.PAD_TONE, "81 02 01 00 01 00 01 00"),
             (sc2.PAD_PULSE | sc2.PAD_TONE, "82 02 00 00"),
-            (sc2.GRIP_PULSE | sc2.GRIP_TONE, "81 05 01 00 01 00 01 00"),
             (sc2.GRIP_PULSE | sc2.GRIP_TONE, "82 05 00 00")])
         self.assertEqual(sc2.STOP_REPEATS, 3)
 
@@ -377,7 +375,7 @@ class Stop(unittest.TestCase):
                 send(model, [sc2.BYE])
                 run(model, sc2.HELLO)
                 send(model, [sc2.BYE])
-                stops = [model.relayed[:7], model.relayed[7:]]
+                stops = [model.relayed[:4], model.relayed[4:]]
                 self.assertEqual(stops, [stop(self.SENDS[bit])] * 2)
                 self.assertEqual(model.relayed.count(RUMBLE_OFF), 2)
         model = session_model()
@@ -391,7 +389,7 @@ class Stop(unittest.TestCase):
                            sc2.encode_command(5, 6, 0)):
             with self.subTest(words=[hex(word) for word in data_words]):
                 self.assert_edge(self.play(data_words), 1.0,
-                                 ["81 05", "82 05"])
+                                 ["82 05"])
 
     def test_a_stop_is_repeated_at_the_next_edge_only(self):
         # Whatever ends the session, and however long after the effect
@@ -401,11 +399,11 @@ class Stop(unittest.TestCase):
                 model = self.play(self.PLAYS[sc2.PAD_PULSE])
                 model.clock = 0.1
                 end(model)
-                self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+                self.assertEqual(model.relayed, stop(["82 02"]))
                 model.relayed.clear()
                 model.clock = 3600.0
                 run(model, sc2.HELLO)
-                self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+                self.assertEqual(model.relayed, stop(["82 02"]))
                 model.relayed.clear()
                 end(model)
                 run(model, sc2.HELLO)
@@ -416,11 +414,11 @@ class Stop(unittest.TestCase):
         # The end had no link: the start stops the tone still running, and
         # the end after it repeats that.
         model = self.lose_the_end(self.PLAYS[sc2.PAD_TONE])
-        self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+        self.assertEqual(model.relayed, stop(["82 02"]))
         model.relayed.clear()
         model.clock = 1.0
         send(model, [sc2.BYE])
-        self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+        self.assertEqual(model.relayed, stop(["82 02"]))
 
     def test_a_new_effect_in_between_keeps_the_repeat(self):
         # A new effect on one side does not end an older one on another, so
@@ -429,7 +427,7 @@ class Stop(unittest.TestCase):
         # the next edge repeats that.
         model = self.lose_the_end(self.PLAYS[sc2.PAD_TONE])
         self.play(sc2.encode_tone(1, 0, 160, 10, 0, 0), 0.3, model)
-        self.assert_edge(model, 0.45, ["81 02", "82 02"])
+        self.assert_edge(model, 0.45, ["82 02"])
         # Done by 1 s, or of another class: the end still repeats.
         for report in (sc2.encode_tone(1, 0, 160, 10, 0, 0),
                        sc2.encode_sweep(5, 0, 10, 60, 200)):
@@ -438,7 +436,7 @@ class Stop(unittest.TestCase):
                 self.play(report, 0.3, model)
                 model.clock = 1.0
                 send(model, [sc2.BYE])
-                self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+                self.assertEqual(model.relayed, stop(["82 02"]))
 
     def test_nothing_played(self):
         # No report at any session edge, and CHECKSUM shows none.
@@ -486,14 +484,14 @@ class Stop(unittest.TestCase):
                 model = self.play(self.PLAYS[sc2.GRIP_PULSE])
                 model.clock = 0.5
                 end(model)
-                self.assertEqual(model.relayed, stop(["81 05", "82 05"]))
+                self.assertEqual(model.relayed, stop(["82 05"]))
                 self.assertEqual(model.queued, STOP["82 05"])
 
     def test_all_classes_running(self):
         model = self.play(sc2.encode_rumble(0x1234, 0))
         for data_words in self.PLAYS.values():
             self.play(data_words, model=model)
-        self.assert_edge(model, 0.1, ["81 02", "82 02", "81 05", "82 05"],
+        self.assert_edge(model, 0.1, ["82 02", "82 05"],
                          rumble=True)
 
     def test_a_long_train_ends_far_in_the_future(self):
@@ -502,8 +500,8 @@ class Stop(unittest.TestCase):
         self.assertGreater(131070 * 65535, 2 ** 32)
         self.assertEqual(sc2.play_ms(train), 8589673)
         # Running 2 h later, done 8589673 ms and the margin after it.
-        for clock, names in ((7200.0, ["81 02", "82 02"]),
-                             (8589.822, ["81 02", "82 02"]),
+        for clock, names in ((7200.0, ["82 02"]),
+                             (8589.822, ["82 02"]),
                              (8589.823, [])):
             with self.subTest(clock=clock):
                 model = self.play(sc2.encode_pulse(0, 0xFFFF, 0xFFFF,
@@ -513,21 +511,21 @@ class Stop(unittest.TestCase):
     def test_effects_of_no_known_end_run_until_a_stop(self):
         # A tone or sweep of 0 ms, an undefined 0x82 command.
         for data_words, names in (
-                (sc2.encode_tone(1, 0, 160, 0, 0, 0), ["81 02", "82 02"]),
-                (sc2.encode_sweep(3, 0, 0, 60, 200), ["81 05", "82 05"]),
-                (sc2.encode_command(2, 3, 0), ["81 02", "82 02"]),
-                (sc2.encode_command(4, 7, 0), ["81 05", "82 05"])):
+                (sc2.encode_tone(1, 0, 160, 0, 0, 0), ["82 02"]),
+                (sc2.encode_sweep(3, 0, 0, 60, 200), ["82 05"]),
+                (sc2.encode_command(2, 3, 0), ["82 02"]),
+                (sc2.encode_command(4, 7, 0), ["82 05"])):
             with self.subTest(words=[hex(word) for word in data_words]):
                 self.assert_edge(self.play(data_words), 1e6, names)
 
     def test_a_shorter_effect_keeps_the_longer_end(self):
         model = self.play(sc2.encode_tone(0, 0, 160, 2000, 0, 0))
         self.play(sc2.encode_tone(1, 0, 160, 10, 0, 0), 0.1, model)
-        self.assert_edge(model, 1.0, ["81 02", "82 02"])
+        self.assert_edge(model, 1.0, ["82 02"])
         # The other way round the later end counts too.
         model = self.play(sc2.encode_tone(0, 0, 160, 10, 0, 0))
         self.play(sc2.encode_tone(1, 0, 160, 2000, 0, 0), 0.1, model)
-        self.assert_edge(model, 2.249, ["81 02", "82 02"])
+        self.assert_edge(model, 2.249, ["82 02"])
 
     def test_a_running_rumble_stops_three_times(self):
         # Rumble alone: the zero three times, and no repeat.

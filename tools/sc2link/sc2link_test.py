@@ -308,9 +308,7 @@ COMMAND_CLICK = 2
 # after a session end covers the last report its stop queued.
 STOP_REPEATS = 3
 STOP_ENTRIES = (
-    (PAD_PULSE | PAD_TONE, report_pulse(2, 1, 1, 1)),
     (PAD_PULSE | PAD_TONE, report_command(2, 0, 0)),
-    (GRIP_PULSE | GRIP_TONE, report_pulse(5, 1, 1, 1)),
     (GRIP_PULSE | GRIP_TONE, report_command(5, 0, 0)),
 )
 

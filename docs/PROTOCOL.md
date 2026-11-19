@@ -539,14 +539,13 @@ PLAIN ────────────────────────�
 - While the last RUMBLE is non-zero the dongle resends its `0x80` every 40 ms, as SDL does: the controller
   stops a rumble that is not refreshed within about 50 ms.
 - The last word of a message that queues a report is accepted only while the controller's relay ring has room
-  for a session's stop (15 of its 31 entries, with rumble on and every class running). A full ring therefore
+  for a session's stop (9 of its 31 entries, with rumble on and every class running). A full ring therefore
   delays the acknowledgement, and the client's resend retries. Without a linked controller the word is
   accepted and its report dropped.
 
-**Stop.** It ends what this dongle relayed that can still be running and sends nothing else, since each stop
-report is itself felt, a tick on the trackpads. It sends, of `81 02 01 00 01 00 01 00` (one 1 µs pulse on both
-pads), `82 02 00 00` (OFF, `HAPTIC_TYPE_OFF` in SDL's `controller_structs.h`, on both pads),
-`81 05 01 00 01 00 01 00` and `82 05 00 00` (the same on both grip actuators), those of the classes it is for,
+**Stop.** It ends what this dongle relayed that can still be running and sends nothing else. It sends
+`82 02 00 00` (OFF, `HAPTIC_TYPE_OFF` in SDL's `controller_structs.h`, on both pads) and `82 05 00 00` (OFF on
+both grip actuators), those of the classes it is for,
 in this order, the list three times since the relay is not acknowledged. Ahead of them goes the `0x80` zero,
 once, or three times while the last `0x80` queued was on; while it was on the zero goes out even with no
 class, which ends rumble, stray plain rumble included. A stop is for the classes that can still run, and for
@@ -558,20 +557,19 @@ ends that time. The times live in RAM across sessions and are empty after a rebo
 nothing starts and ends without a report, and the session edge after one that stopped something repeats that
 stop.
 
-| Class | Reports | Runs for | Stop reports |
+| Class | Reports | Runs for | Stop report |
 |---|---|---|---|
-| pad pulse | `0x81`, sides 0 to 2 | (on + off) × repeat µs, a repeat of 0 counted as 1; nothing with on 0 | `81 02`, `82 02` |
-| grip pulse | `0x81`, sides 3 to 5 | as pad pulse | `81 05`, `82 05` |
-| pad tone | `0x83`, `0x84` and `0x82` commands 3 to 7, sides 0 to 2 | the duration; until a stop for 0 ms and for the commands | `81 02`, `82 02` |
-| grip tone | as pad tone, sides 3 to 5 | as pad tone | `81 05`, `82 05` |
+| pad pulse | `0x81`, sides 0 to 2 | (on + off) × repeat µs, a repeat of 0 counted as 1; nothing with on 0 | `82 02` |
+| grip pulse | `0x81`, sides 3 to 5 | as pad pulse | `82 05` |
+| pad tone | `0x83`, `0x84` and `0x82` commands 3 to 7, sides 0 to 2 | the duration; until a stop for 0 ms and for the commands | `82 02` |
+| grip tone | as pad tone, sides 3 to 5 | as pad tone | `82 05` |
 
 `0x82` OFF, tick and click (18 and 24 ms) need no stop, and none ends a `0x85` script. Commands 3 to 7 are
 undefined for `0x82`, but a host decodes 3, 6 and 7 like a tone, a script and a sweep, of no known length. On a
-controller the `0x81` or the OFF on the side of a running pulse train ended it alone, an OFF on another side
-(`82 03 00 00`) did not, and the `0x80` zero, the two pad reports and `82 05 00 00` together ended trains on
-the pads and on both grips and a tone and a sweep on a pad. Which report ended the tone, the sweep and the grip
-train is not known, hence the pairs and the zero ahead of every stop that sends a report. `81 05` and the grip
-tone class are unmeasured.
+controller (2026-11-19) OFF alone ended a `0x81` train, a tone and a sweep played on either side or both sides
+of its group, and nothing was felt or measured when it had nothing to end. OFF on the other group
+(`82 03 00 00` for a pad train) ended nothing. A 1 µs `0x81` also ends a train but is itself a tick on the pads
+and a hard knock on the grips, so none is sent.
 
 **Messages.** The bits below are data bits 14..0. A header with bit 14 set is a COMMAND; otherwise bits 13..11
 are the opcode. Unused bits are zero. Payload words follow the header. A 16-bit field travels as its bits

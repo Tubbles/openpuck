@@ -58,8 +58,7 @@ SC2LinkController g_sc2LinkCtl;
 
 // The side byte of 0x82 to 0x85: 0 left pad, 1 right pad, 2 both pads, 3 left
 // grip actuator, 4 right grip actuator, 5 both grip actuators. 0x81 swaps the
-// pads (0 right, 1 left) and keeps 2 for both, its 3 to 5 are unmeasured. 6
-// and 7 name nothing.
+// pads (0 right, 1 left) and keeps 2 to 5. 6 and 7 name nothing.
 #define SC2_SIDE_BOTH_PADS 2
 #define SC2_SIDE_BOTH_GRIPS 5
 #define SC2_SIDE_MAX 5
@@ -88,27 +87,18 @@ struct Sc2Stop {
 };
 
 // What a session's start and end queue after the 0x80 zero, in this order,
-// the whole list RUMBLE_STOP_REPS times since the relay is not acknowledged.
-// Each entry is felt, a tick on the trackpads even with nothing to end
-// (2026-11-19), so one goes out only for a class it is sent for. On a
-// controller (2026-11-19) the 0x81 or the OFF on a pad train's own side ended
-// it alone, an OFF on another side did not, and the 0x80 zero, the two pad
-// entries and the grip OFF together ended trains on the pads and on both
-// grips and a tone and a sweep on a pad. Which report ended the tone, the
-// sweep and the grip train is not known, hence the pairs and the zero in
-// front of every stop that sends an entry. The grip 0x81 and the grip tone
-// class are unmeasured. tools/sc2link/test_sc2link.py reads this table: plain
-// numbers, SC2_SIDE_* and ORed classes only.
+// the whole list RUMBLE_STOP_REPS times since the relay is not acknowledged:
+// 0x82 OFF (command 0, HAPTIC_TYPE_OFF in SDL's controller_structs.h) on both
+// pads and on both grip actuators, each only for a class it is sent for. On a
+// controller (2026-11-19) OFF alone ended a 0x81 train, a tone and a sweep
+// played on either side or both sides of its group, and nothing was felt or
+// measured when it had nothing to end. OFF on the other group ended nothing,
+// and nothing ends a 0x85 script. A 1 us 0x81 also ends a train but is itself
+// a tick on the pads and a hard knock on the grips, so none is sent.
+// tools/sc2link/test_sc2link.py reads this table: plain numbers, SC2_SIDE_*
+// and ORed classes only.
 static const Sc2Stop SC2_STOP[] = {
-	// 0x81 on both pads: on 1 us, off 1 us, repeat 1
-	{ SC2_PAD_PULSE | SC2_PAD_TONE,
-	  8,
-	  { 0x81, SC2_SIDE_BOTH_PADS, 1, 0, 1, 0, 1, 0 } },
-	// 0x82 OFF (command 0, HAPTIC_TYPE_OFF in SDL's controller_structs.h)
 	{ SC2_PAD_PULSE | SC2_PAD_TONE, 4, { 0x82, SC2_SIDE_BOTH_PADS, 0, 0 } },
-	{ SC2_GRIP_PULSE | SC2_GRIP_TONE,
-	  8,
-	  { 0x81, SC2_SIDE_BOTH_GRIPS, 1, 0, 1, 0, 1, 0 } },
 	{ SC2_GRIP_PULSE | SC2_GRIP_TONE,
 	  4,
 	  { 0x82, SC2_SIDE_BOTH_GRIPS, 0, 0 } },
