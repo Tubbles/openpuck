@@ -43,7 +43,9 @@ SC2LinkController g_sc2LinkCtl;
 // last word is told from the next, and bits 14 to 0 are the data.
 #define SC2_TOGGLE_SHIFT 15
 #define SC2_DATA 0x7FFF
-#define SC2_PROTOCOL_VERSION 1
+// Raised with every change of the word layouts, so a client can tell them
+// apart (docs/PROTOCOL.md 9.5.1).
+#define SC2_PROTOCOL_VERSION 2
 #define SC2_SESSION_MS 500u
 // SDL refreshes a running rumble this often: the controller stops one that
 // is not refreshed within about 50 ms, and no hop before the dongle resends.
@@ -53,15 +55,39 @@ SC2LinkController g_sc2LinkCtl;
 #define SC2_MAX_PAYLOAD 4
 // A controller report with its id, the longest being 0x80 and 0x83.
 #define SC2_REPORT_MAX 10
-// The command report that stops the effects of 0x81 to 0x85: command 0 is
-// HAPTIC_TYPE_OFF in SDL's controller_structs.h, side 3 both pads, gain 0.
-static const uint8_t SC2_HAPTIC_OFF[] = { 0x82, 3, 0, 0 };
-// A session's start and end each queue a rumble stop burst and as many OFF
-// reports, since the relay is not acknowledged.
-#define SC2_STOP_ENTRIES (2 * RUMBLE_STOP_REPS)
 
-// A header with data bit 14 set is a COMMAND, whose 13 bits leave no room for
-// a 3-bit opcode in one word. Otherwise the opcode is in bits 13 to 11.
+// The side byte of 0x82 to 0x85: 0 left pad, 1 right pad, 2 both pads, 3 left
+// grip actuator, 4 right grip actuator, 5 both grip actuators. 0x81 swaps the
+// pads (0 right, 1 left) and keeps 2 for both, its 3 to 5 are unmeasured. 6
+// and 7 name nothing.
+#define SC2_SIDE_BOTH_PADS 2
+#define SC2_SIDE_BOTH_GRIPS 5
+#define SC2_SIDE_MAX 5
+
+struct Sc2Report {
+	uint8_t length;
+	uint8_t bytes[SC2_REPORT_MAX];
+};
+
+// What a session's start and end queue after the rumble stop burst, in this
+// order, the whole list RUMBLE_STOP_REPS times since the relay is not
+// acknowledged. On a controller (2026-11-19) a 0x81 or a 0x82 OFF on a running
+// 0x81 train's pad ended the train, an OFF on another side did not. Whether
+// OFF ends a tone, sweep or script is not measured. tools/sc2link/
+// test_sc2link.py reads this table: plain numbers and SC2_SIDE_* only.
+static const Sc2Report SC2_STOP[] = {
+	// 0x81 on both pads: on 1 us, off 1 us, repeat 1
+	{ 8, { 0x81, SC2_SIDE_BOTH_PADS, 1, 0, 1, 0, 1, 0 } },
+	// 0x82 OFF (command 0, HAPTIC_TYPE_OFF in SDL's controller_structs.h)
+	{ 4, { 0x82, SC2_SIDE_BOTH_PADS, 0, 0 } },
+	{ 4, { 0x82, SC2_SIDE_BOTH_GRIPS, 0, 0 } },
+};
+static const uint8_t SC2_STOP_REPORTS = sizeof SC2_STOP / sizeof SC2_STOP[0];
+// Relay entries one stop takes at most: a rumble stop burst and the list.
+#define SC2_STOP_ENTRIES ((1 + SC2_STOP_REPORTS) * RUMBLE_STOP_REPS)
+
+// A header with data bit 14 set is a COMMAND, whose 14 bits fill the word and
+// leave no room for a 3-bit opcode. Otherwise the opcode is in bits 13 to 11.
 #define SC2_COMMAND_BIT 0x4000
 enum Sc2Op {
 	SC2_OP_CONTROL,
@@ -422,8 +448,8 @@ static const uint8_t SC2_BOOT_KNOCK[][2] = {
 static const uint8_t SC2_BOOT_KNOCK_STEPS =
 	sizeof SC2_BOOT_KNOCK / sizeof SC2_BOOT_KNOCK[0];
 #define SC2_BOOT_KNOCK_GAP_MS 500u
-// Long enough for the rumble stop burst to leave on the following RF polls.
-#define SC2_BOOT_DELAY_MS 50u
+// Long enough for a full relay ring (31 entries, one per 4 ms RF poll) to leave, so the stop is never cut short.
+#define SC2_BOOT_DELAY_MS 150u
 
 // Loop only: SC2_REBOOT_NONE, SC2_REBOOT_UF2 or the mode to reboot into.
 #define SC2_REBOOT_NONE 0xFF
@@ -736,18 +762,27 @@ static int8_t sc2ControlWords(uint16_t header)
 	}
 }
 
+static uint8_t sc2Side(uint16_t header)
+{
+	return (uint8_t)((header >> 8) & 7);
+}
+
 // The payload words that follow a header, or -1 for a header the parser
-// rejects: a reserved opcode, an undefined CONTROL sub or a non-zero unused
-// bit.
+// rejects: a reserved opcode, an undefined CONTROL sub, a non-zero unused bit
+// or a side that names no actuator.
 static int8_t sc2PayloadWords(uint16_t header)
 {
-	switch (sc2Op(header)) {
+	uint8_t op = sc2Op(header);
+	if (op != SC2_OP_CONTROL && op != SC2_OP_RUMBLE &&
+	    sc2Side(header) > SC2_SIDE_MAX)
+		return -1;
+	switch (op) {
 	case SC2_OP_CONTROL:
 		return sc2ControlWords(header);
 	case SC2_OP_COMMAND:
-		return (header & 0x2000) ? -1 : 0;
+		return 0;
 	case SC2_OP_SCRIPT:
-		return (header & 0x0400) ? -1 : 1;
+		return 1;
 	case SC2_OP_RUMBLE:
 		if (header & 0x07F8)
 			return -1;
@@ -756,10 +791,10 @@ static int8_t sc2PayloadWords(uint16_t header)
 			return (header & 3) ? -1 : 0;
 		return 2;
 	case SC2_OP_PULSE:
-		return (header & 0x04F8) ? -1 : 3;
+		return (header & 0x00F8) ? -1 : 3;
 	case SC2_OP_SWEEP:
 	case SC2_OP_TONE:
-		return (header & 0x0400) ? -1 : 4;
+		return 4;
 	default:
 		return -1;
 	}
@@ -798,13 +833,13 @@ static uint16_t sc2Join(uint16_t high, uint8_t at, uint16_t low)
 static uint8_t sc2BuildReport(uint16_t header, const uint16_t *payload,
 			      uint8_t out[SC2_REPORT_MAX])
 {
-	uint8_t side = (uint8_t)((header >> 8) & 3);
+	uint8_t side = sc2Side(header);
 	uint8_t gain = (uint8_t)(header & 0xFF);
 	switch (sc2Op(header)) {
 	case SC2_OP_COMMAND:
 		out[0] = 0x82;
 		out[1] = side;
-		out[2] = (uint8_t)((header >> 10) & 7);
+		out[2] = (uint8_t)((header >> 11) & 7);
 		out[3] = gain;
 		return 4;
 	case SC2_OP_SCRIPT:
@@ -891,9 +926,9 @@ static bool sc2QueueReport(const uint8_t *report, uint8_t length)
 			    bond);
 }
 
-// Every kind of haptic on both sides: the rumble of 0x80 and, through OFF,
-// the pulses, tones, sweeps and scripts. A stop passes the gates a stop of
-// plain rumble passes. True when the OFF reports were queued.
+// The rumble of 0x80 and, through SC2_STOP, the pulses and whatever else its
+// reports end. A stop passes the gates a stop of plain rumble passes. True
+// when SC2_STOP was queued.
 static bool sc2StopHaptics(void)
 {
 	g_sc2Session.rumbleOn = false;
@@ -906,23 +941,27 @@ static bool sc2StopHaptics(void)
 	if (!hapticLinkUp(bond))
 		return false;
 	bool queued = false;
-	for (uint8_t i = 0; i < RUMBLE_STOP_REPS; i++)
-		if (relayEnqueue(SC2_HAPTIC_OFF[0], SC2_HAPTIC_OFF + 1,
-				 sizeof SC2_HAPTIC_OFF - 1, true, bond))
-			queued = true;
+	for (uint8_t rep = 0; rep < RUMBLE_STOP_REPS; rep++)
+		for (uint8_t i = 0; i < SC2_STOP_REPORTS; i++)
+			if (relayEnqueue(SC2_STOP[i].bytes[0],
+					 SC2_STOP[i].bytes + 1,
+					 (uint8_t)(SC2_STOP[i].length - 1),
+					 true, bond))
+				queued = true;
 	return queued;
 }
 
 // Stops every haptic and drops a partial message. Words are plain rumble
-// again. The OFF report counts for CHECKSUM, so a client can tell from the
-// next session that the stop was queued.
+// again. The last report of SC2_STOP counts for CHECKSUM, so a client can tell
+// from the next session that the stop was queued.
 static void sc2EndSession(void)
 {
 	Sc2Session &session = g_sc2Session;
+	const Sc2Report &last = SC2_STOP[SC2_STOP_REPORTS - 1];
 	session.active = false;
 	session.need = 0;
-	session.reportLength = sc2StopHaptics() ? sizeof SC2_HAPTIC_OFF : 0;
-	memcpy(session.report, SC2_HAPTIC_OFF, session.reportLength);
+	session.reportLength = sc2StopHaptics() ? last.length : 0;
+	memcpy(session.report, last.bytes, session.reportLength);
 }
 
 static void sc2StartSession(unsigned long ms)

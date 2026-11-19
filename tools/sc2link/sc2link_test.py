@@ -130,7 +130,8 @@ def eviocgabs(code):
 
 # ---- the word protocol ------------------------------------------------------
 
-PROTOCOL_VERSION = 1
+# The word layouts below. The dongle shows its own in every acknowledgement.
+PROTOCOL_VERSION = 2
 SESSION_TIMEOUT_S = 0.5
 # A client waits this long before its HELLO so any earlier session has ended.
 SILENCE_S = SESSION_TIMEOUT_S + 0.1
@@ -145,7 +146,7 @@ MODE_MAX = 13
 TOGGLE_SHIFT = 15
 DATA = 0x7FFF
 # A header with data bit 14 set is a COMMAND, otherwise bits 13 to 11 hold the
-# opcode.
+# opcode. Every header but CONTROL and RUMBLE has the side in bits 10 to 8.
 COMMAND_BIT = 0x4000
 OP_CONTROL = 0
 OP_SCRIPT = 1
@@ -194,7 +195,7 @@ def low(value):
 
 
 def encode_command(side, command, gain):
-    return [header(OP_COMMAND, command << 10 | side_gain(side, gain))]
+    return [header(OP_COMMAND, command << 11 | side_gain(side, gain))]
 
 
 def encode_script(side, script, gain):
@@ -264,6 +265,14 @@ def report_rumble(left, right):
                        right, 0)
 
 
+def report_plain_rumble(word):
+    """The 0x80 a plain rumble word becomes at the default rumble style and
+    strength (200 %)."""
+    def speed(byte):
+        return min(byte * 257 * 2, 0xFFFF)
+    return report_rumble(speed(word >> 8), speed(word & 0xFF))
+
+
 def report_pulse(side, on_us, off_us, repeat):
     return struct.pack("<BBHHH", 0x81, side, on_us, off_us, repeat)
 
@@ -278,10 +287,13 @@ def report_tone(side, gain, frequency_hz, duration_ms, lfo_hz, lfo_depth):
                        duration_ms, lfo_hz, lfo_depth)
 
 
-# The OFF command a session's start and end send, meant for both pads. Side 3
-# of 0x82 is the left internal actuator, so it does not stop the pads.
-# CHECKSUM covers the one a session end queues.
-STOP_REPORT = report_command(3, 0, 0)
+# What a session's start and end queue after a rumble stop, in this order,
+# the whole list STOP_REPEATS times (SC2_STOP in mode_sc2link.cpp). A rumble
+# stop goes out STOP_REPEATS times too while rumble is on (RUMBLE_STOP_REPS in
+# haptics.h). CHECKSUM covers the last report of a session end's stop.
+STOP_REPEATS = 3
+STOP_REPORTS = (report_pulse(2, 1, 1, 1), report_command(2, 0, 0),
+                report_command(5, 0, 0))
 
 
 def crc16(data):
@@ -305,9 +317,11 @@ def word_field(name):
 
 
 # The side byte names other actuators per report (docs/PROTOCOL.md 9.5.1).
-# Pulse: 0 right pad, 1 left pad, 2 both pads. The others: 0 left pad, 1 right
-# pad, 2 both pads, 3 left internal actuator. None is silent.
-SIDE = Field("side", 0, 3)
+# Pulse: 0 right pad, 1 left pad, 2 both pads, 3 to 5 unmeasured. The others:
+# 0 left pad, 1 right pad, 2 both pads, 3 left grip actuator, 4 right grip
+# actuator, 5 both grip actuators. The dongle rejects 6 and 7.
+SIDE_MAX = 5
+SIDE = Field("side", 0, SIDE_MAX)
 GAIN = Field("gain", -128, 127)
 COMMAND = Field("command", 0, 7)
 ON_US = word_field("on_us")
@@ -364,9 +378,9 @@ def describe_case(message, values):
     return f"{message.name} " + (", ".join(changed) or "all minimum")
 
 
-def ack_state(counter, session, expected):
+def ack_state(counter, session, expected, version=PROTOCOL_VERSION):
     return ((counter & 0xFF) << 8 | (0x80 if session else 0)
-            | (expected & 7) << 4 | PROTOCOL_VERSION)
+            | (expected & 7) << 4 | version)
 
 
 def decode_state(state):
@@ -384,13 +398,25 @@ def format_state(state):
             f"expected {fields['expected']} v{fields['version']}")
 
 
+def version_problem(state):
+    """Why a dongle that acknowledged with this ACK_STATE gets no messages,
+    or None."""
+    version = decode_state(state)["version"]
+    if version == PROTOCOL_VERSION:
+        return None
+    return (f"the dongle speaks SC2 Link protocol version {version}, this "
+            f"tool version {PROTOCOL_VERSION}: their word layouts differ, so "
+            "no message is sent. Use a tool and a firmware of the same "
+            "version.")
+
+
 def opcode_of(head):
     return OP_COMMAND if head & COMMAND_BIT else head >> 11 & 7
 
 
 # Header bits that must be zero, per opcode.
-UNUSED_BITS = {OP_COMMAND: 0x2000, OP_SCRIPT: 0x0400, OP_RUMBLE: 0x07F8,
-               OP_PULSE: 0x04F8, OP_SWEEP: 0x0400, OP_TONE: 0x0400}
+UNUSED_BITS = {OP_COMMAND: 0, OP_SCRIPT: 0, OP_RUMBLE: 0x07F8,
+               OP_PULSE: 0x00F8, OP_SWEEP: 0, OP_TONE: 0}
 PAYLOAD_WORDS = {OP_COMMAND: 0, OP_SCRIPT: 1, OP_RUMBLE: 2, OP_PULSE: 3,
                  OP_SWEEP: 4, OP_TONE: 4}
 
@@ -409,8 +435,11 @@ def payload_words(head):
         return None
     if opcode not in UNUSED_BITS or head & UNUSED_BITS[opcode]:
         return None
-    if opcode == OP_RUMBLE and head & 4:
-        return None if head & 3 else 0
+    if opcode == OP_RUMBLE:
+        if head & 4:
+            return None if head & 3 else 0
+    elif head >> 8 & 7 > SIDE_MAX:
+        return None
     return PAYLOAD_WORDS[opcode]
 
 
@@ -441,9 +470,9 @@ def join(tops, at, low_bits):
 def build_report(head, payload):
     """The report a complete message queues, None for CONTROL."""
     opcode = opcode_of(head)
-    side, gain = head >> 8 & 3, signed8(head & 0xFF)
+    side, gain = head >> 8 & 7, signed8(head & 0xFF)
     if opcode == OP_COMMAND:
-        return report_command(side, head >> 10 & 7, gain)
+        return report_command(side, head >> 11 & 7, gain)
     if opcode == OP_SCRIPT:
         return report_script(side, payload[0], gain)
     if opcode == OP_RUMBLE:
@@ -476,15 +505,23 @@ class Outcome:
 
 
 class Model:
-    """What the dongle does with each word, its timeouts and knock aside.
+    """What the dongle does with each word, its timeouts, knock and rumble
+    resends aside.
 
     linked says whether a report reaches the relay: without a linked
     controller the dongle drops it, and CHECKSUM then answers 0xFFFF.
+    relayed holds the reports queued for the controller, in order. version
+    is the protocol version the acknowledgements show.
     """
 
-    def __init__(self, counter=0, linked=True):
+    def __init__(self, counter=0, linked=True, version=PROTOCOL_VERSION):
         self.counter = counter
         self.linked = linked
+        self.version = version
+        self.relayed = []
+        # Whether the last 0x80 queued was on, which makes a rumble stop go
+        # out STOP_REPEATS times.
+        self.rumble_on = False
         self.active = False
         self.hello = 0
         self.head = 0
@@ -501,13 +538,32 @@ class Model:
     def state(self):
         expected = self.need if self.active else (
             len(HELLO) - self.hello if self.hello else 0)
-        return ack_state(self.counter, self.active, expected)
+        return ack_state(self.counter, self.active, expected, self.version)
 
     def end_session(self):
         """BYE, a rejected word or the timeout, with its stop."""
         self.active = False
         self.need = 0
-        self.queued = STOP_REPORT if self.linked else b""
+        self._stop()
+        self.queued = STOP_REPORTS[-1] if self.linked else b""
+
+    def _stop(self):
+        """What a session's start and end queue."""
+        self._relay(report_rumble(0, 0))
+        for _ in range(STOP_REPEATS):
+            for report in STOP_REPORTS:
+                self._relay(report)
+
+    def _relay(self, report):
+        if not self.linked:
+            return
+        copies = 1
+        if report[0] == 0x80:
+            on = report[1] != 0
+            if self.rumble_on and not on:
+                copies = STOP_REPEATS
+            self.rumble_on = on
+        self.relayed += [report] * copies
 
     def word(self, word):
         if self._copy(word):
@@ -519,8 +575,10 @@ class Model:
             return outcome
         self.end_word = None
         if not self._hello_step(word):
+            self._relay(report_plain_rumble(word))
             return Outcome(False)
         if self.hello == len(HELLO):
+            self._stop()
             self.active = True
             self.hello = 0
             self.need = 0
@@ -569,6 +627,7 @@ class Model:
         opcode, sub = opcode_of(self.head), self.head >> 8 & 7
         report = build_report(self.head, self.payload)
         if opcode != OP_CONTROL:
+            self._relay(report)
             self.queued = report if self.linked else b""
             return last
         if sub == CONTROL_BYE:
@@ -977,8 +1036,12 @@ class Client:
             print(format_ack(ack, f"HELLO {index + 1}/4 "))
             if not acknowledged(ack, word):
                 return False
-        state = decode_state(ack.state)
-        if not state["session"] or state["version"] != PROTOCOL_VERSION:
+            # Known from the first acknowledgement, so no session opens.
+            problem = version_problem(ack.state)
+            if problem:
+                print(problem)
+                return False
+        if not decode_state(ack.state)["session"]:
             print(f"no session: {format_state(ack.state)}")
             return False
         self.toggle = HELLO[-1] >> TOGGLE_SHIFT
@@ -1322,6 +1385,9 @@ class SelfTest:
         self.words += 1
         if ack is None:
             return [f"0x{word:04x}: no acknowledgement"]
+        problem = version_problem(ack.state)
+        if problem:
+            raise SystemExit(f"result: FAIL, {problem}")
         problems = []
         if ack.advance != 1:
             problems.append(f"0x{word:04x}: counter advanced by {ack.advance}")
@@ -1467,6 +1533,7 @@ def selftest_framing(test):
         ("reserved opcode 7 ends the session", [header(7)]),
         ("a non-zero unused header bit ends the session",
          [header(OP_PULSE, 8)]),
+        ("side 6 ends the session", [header(OP_COMMAND, 6 << 8)]),
         ("an undefined CONTROL sub ends the session", [0x0700]),
         ("a non-zero unused payload bit ends the session",
          [header(OP_SCRIPT), 0x0100]),
@@ -1509,7 +1576,7 @@ def selftest_stop(test):
     """NOPs hold a session, silence ends it with its stop.
 
     Nothing plays meanwhile: an effect that lasts until the stop would run
-    longer than a second, and the stop's OFF does not reach the pads.
+    longer than a second.
     """
     problems = []
     for _ in range(5):
@@ -1521,7 +1588,7 @@ def selftest_stop(test):
         return
     time_out(test, "the session times out")
     test.hello("HELLO after the timeout opens a new session")
-    test.case("CHECKSUM shows the OFF report the timeout queued",
+    test.case("CHECKSUM shows the last stop report the timeout queued",
               test.stamp([CHECKSUM]))
 
 
@@ -1591,8 +1658,9 @@ def build_parser():
             f"{message.name} " + " ".join(field.name.upper()
                                           for field in message.fields)
             for message in MESSAGES.values()) + "; rumble stop. SIDE of a "
-        "pulse: 0 right pad, 1 left pad, 2 both pads. Of the others: 0 left "
-        "pad, 1 right pad, 2 both pads, 3 left internal actuator.")
+        "pulse: 0 right pad, 1 left pad, 2 both pads, 3 to 5 unmeasured. Of "
+        "the others: 0 left pad, 1 right pad, 2 both pads, 3 left grip "
+        "actuator, 4 right grip actuator, 5 both grip actuators.")
     send.add_argument("message", choices=sorted(MESSAGES))
     send.add_argument("fields", nargs="*", help="field values, 0x for hex")
     send.add_argument("--hold", type=float, default=0.0, metavar="SECONDS",

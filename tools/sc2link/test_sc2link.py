@@ -8,6 +8,7 @@ import contextlib
 import io
 import math
 import os
+import re
 import struct
 import sys
 import types
@@ -17,6 +18,21 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import sc2link_test as sc2  # noqa: E402
+
+FIRMWARE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                        "..", "OpenPuck")
+
+
+def firmware_source(name):
+    with open(os.path.join(FIRMWARE, name), encoding="utf-8") as file:
+        return file.read()
+
+
+def firmware_defines(source):
+    """The #defines of plain integers."""
+    return {name: int(value, 0) for name, value in
+            re.findall(r"^#define (\w+) (0x[0-9A-Fa-f]+|\d+)$", source,
+                       re.M)}
 
 
 def run(model, words):
@@ -58,22 +74,49 @@ class StructLayouts(unittest.TestCase):
 
 class Encoder(unittest.TestCase):
     def test_protocol_example(self):
-        # docs/PROTOCOL.md: COMMAND data 0x4AF6 becomes 82 02 02 F6, a click
+        # docs/PROTOCOL.md: COMMAND data 0x52F6 becomes 82 02 02 F6, a click
         # on both pads.
-        self.assertEqual(sc2.encode_command(2, 2, -10), [0x4AF6])
+        self.assertEqual(sc2.encode_command(2, 2, -10), [0x52F6])
         self.assertEqual(sc2.report_command(2, 2, -10).hex(), "820202f6")
 
     def test_layouts(self):
         # The bit layouts of the message table in docs/PROTOCOL.md.
+        self.assertEqual(sc2.encode_command(5, 7, -1), [0x7DFF])
         self.assertEqual(sc2.encode_script(1, 0xFF, -1), [0x09FF, 0x00FF])
+        self.assertEqual(sc2.encode_script(5, 0, -128), [0x0D80, 0x0000])
         self.assertEqual(sc2.encode_rumble(0xFFFF, 0x1234),
                          [0x1002, 0x7FFF, 0x1234])
         self.assertEqual(sc2.encode_pulse(3, 0xFFFF, 1, 0x8000),
                          [0x1B05, 0x7FFF, 0x0001, 0x0000])
+        self.assertEqual(sc2.encode_pulse(5, 0, 0, 0),
+                         [0x1D00, 0x0000, 0x0000, 0x0000])
         self.assertEqual(sc2.encode_sweep(1, -128, 0xFFFF, 2, 0x8003),
                          [0x2180, 0x7FFF, 0x0002, 0x0003, 0x0005])
+        self.assertEqual(sc2.encode_sweep(4, 0, 0, 0, 0),
+                         [0x2400, 0x0000, 0x0000, 0x0000, 0x0000])
         self.assertEqual(sc2.encode_tone(2, 127, 0xFFFF, 4, 0x8005, 0xFF),
                          [0x2A7F, 0x7FFF, 0x0004, 0x0005, 0x05FF])
+        self.assertEqual(sc2.encode_tone(5, 0, 0, 0, 0, 0),
+                         [0x2D00, 0x0000, 0x0000, 0x0000, 0x0000])
+
+    def test_every_side(self):
+        # Sides 0 to 5 reach the report of every message that has one, with
+        # every other field at its minimum and at its maximum.
+        for name in ("command", "script", "pulse", "sweep", "tone"):
+            message = sc2.MESSAGES[name]
+            others = message.fields[1:]
+            for side in range(sc2.SIDE_MAX + 1):
+                for rest in (tuple(field.minimum for field in others),
+                             tuple(field.maximum for field in others)):
+                    values = (side,) + rest
+                    with self.subTest(case=sc2.describe_case(message, values)):
+                        report = message.report(*values)
+                        self.assertEqual(report[1], side)
+                        model = session_model()
+                        send(model, message.encode(*values))
+                        self.assertTrue(model.active)
+                        self.assertEqual(model.queued, report)
+                        self.assertEqual(model.relayed[-1], report)
 
     def test_word_counts(self):
         counts = {"command": 1, "script": 2, "rumble": 3, "pulse": 4,
@@ -131,7 +174,7 @@ class Encoder(unittest.TestCase):
         self.assertEqual(sc2.parse_fields(pulse, ["3", "0x10", "0", "65535"]),
                          (3, 16, 0, 65535))
         with self.assertRaises(ValueError):
-            sc2.parse_fields(pulse, ["4", "0", "0", "0"])
+            sc2.parse_fields(pulse, ["6", "0", "0", "0"])
         with self.assertRaises(ValueError):
             sc2.parse_fields(pulse, ["1", "0", "0"])
 
@@ -163,10 +206,10 @@ class Decoder(unittest.TestCase):
         self.assertEqual(outcomes[-1].echo, 0xFFFF)
 
     def test_session_end_queues_the_stop(self):
-        # A message, BYE, a new session: CHECKSUM covers the end's OFF,
-        # since a session start queues the same stop but leaves CHECKSUM.
-        self.assertEqual(sc2.STOP_REPORT.hex(), "82030000")
-        for linked, expected in ((True, sc2.crc16(sc2.STOP_REPORT)),
+        # A message, BYE, a new session: CHECKSUM covers the last report of
+        # the end's stop, since a session start queues the same stop but
+        # leaves CHECKSUM.
+        for linked, expected in ((True, sc2.crc16(sc2.STOP_REPORTS[-1])),
                                  (False, 0xFFFF)):
             model = session_model(linked)
             send(model, sc2.encode_pulse(3, 20000, 20000, 1000) + [sc2.BYE])
@@ -182,12 +225,78 @@ class Decoder(unittest.TestCase):
         self.assertEqual(sc2.crc16(b""), 0xFFFF)
 
 
+class Stop(unittest.TestCase):
+    """What a session's start and end queue for the controller."""
+
+    RUMBLE_OFF = sc2.report_rumble(0, 0)
+    ROUNDS = list(sc2.STOP_REPORTS) * sc2.STOP_REPEATS
+
+    def test_reports(self):
+        self.assertEqual([report.hex(" ") for report in sc2.STOP_REPORTS],
+                         ["81 02 01 00 01 00 01 00", "82 02 00 00",
+                          "82 05 00 00"])
+        self.assertEqual(sc2.STOP_REPEATS, 3)
+
+    def test_firmware_queues_the_same(self):
+        source = firmware_source("mode_sc2link.cpp")
+        defines = firmware_defines(source)
+        table = re.search(r"SC2_STOP\[\] = \{(.*?)\n\};", source, re.S)
+        reports = []
+        for length, body in re.findall(r"\{\s*(\d+),\s*\{([^}]*)\}\s*\}",
+                                       table.group(1)):
+            items = [item.strip() for item in body.split(",")]
+            values = [defines[item] if item in defines else int(item, 0)
+                      for item in items]
+            self.assertEqual(len(values), int(length))
+            reports.append(bytes(values))
+        self.assertEqual(reports, list(sc2.STOP_REPORTS))
+        self.assertEqual(defines["SC2_PROTOCOL_VERSION"],
+                         sc2.PROTOCOL_VERSION)
+        self.assertEqual(defines["SC2_SIDE_MAX"], sc2.SIDE_MAX)
+        haptics = firmware_defines(firmware_source("haptics.h"))
+        self.assertEqual(haptics["RUMBLE_STOP_REPS"], sc2.STOP_REPEATS)
+
+    def test_every_session_edge(self):
+        ends = {"BYE": lambda model: send(model, [sc2.BYE]),
+                "a rejected word": lambda model: send(model, [0x3800]),
+                "the timeout": lambda model: model.end_session()}
+        for name, end in ends.items():
+            with self.subTest(end=name):
+                model = sc2.Model()
+                run(model, sc2.HELLO)
+                self.assertEqual(model.relayed,
+                                 [self.RUMBLE_OFF] + self.ROUNDS)
+                model.relayed.clear()
+                end(model)
+                self.assertFalse(model.active)
+                self.assertEqual(model.relayed,
+                                 [self.RUMBLE_OFF] + self.ROUNDS)
+
+    def test_a_running_rumble_stops_three_times(self):
+        model = session_model()
+        send(model, sc2.encode_rumble(0x1234, 0))
+        model.relayed.clear()
+        send(model, [sc2.BYE])
+        self.assertEqual(model.relayed, [self.RUMBLE_OFF] * 3 + self.ROUNDS)
+        # Plain rumble before a HELLO counts the same.
+        model.word(0x0100)
+        run(model, sc2.HELLO)
+        self.assertEqual(model.relayed[-1 - 3 - len(self.ROUNDS):],
+                         [sc2.report_plain_rumble(0x0100)]
+                         + [self.RUMBLE_OFF] * 3 + self.ROUNDS)
+
+    def test_nothing_without_a_controller(self):
+        model = session_model(linked=False)
+        send(model, sc2.encode_rumble(1, 2) + [sc2.BYE])
+        self.assertEqual(model.relayed, [])
+
+
 class State(unittest.TestCase):
     def test_ack_state_fields(self):
         state = sc2.ack_state(0x1FF, True, 4)
-        self.assertEqual(state, 0xFFC1)
+        self.assertEqual(state, 0xFFC2)
         self.assertEqual(sc2.decode_state(state), {
-            "counter": 0xFF, "session": 1, "expected": 4, "version": 1})
+            "counter": 0xFF, "session": 1, "expected": 4, "version": 2})
 
     def test_plain_rumble_outside_a_session(self):
         model = sc2.Model()
@@ -318,10 +427,19 @@ class Framing(unittest.TestCase):
 
     def test_rejected_headers(self):
         for word in (0x3000, 0x3800, 0x0700, 0x0001, 0x0300, 0x0501,
-                     0x060E, 0x6000, 0x0C00, 0x1008, 0x1005, 0x1C00,
-                     0x2400, 0x2C00):
+                     0x060E, 0x1008, 0x1005, 0x1400, 0x1808, 0x1880):
             with self.subTest(word=hex(word)):
                 self.assert_rejected([word])
+
+    def test_sides_6_and_7_are_rejected(self):
+        for opcode in (sc2.OP_COMMAND, sc2.OP_SCRIPT, sc2.OP_PULSE,
+                       sc2.OP_SWEEP, sc2.OP_TONE):
+            for side in (6, 7):
+                word = sc2.header(opcode, side << 8)
+                with self.subTest(word=hex(word)):
+                    self.assertIsNone(sc2.payload_words(word))
+                    model = self.assert_rejected([word])
+                    self.assertEqual(model.queued, sc2.STOP_REPORTS[-1])
 
     def test_rejected_payloads(self):
         self.assert_rejected([sc2.header(sc2.OP_SCRIPT), 0x0100])
@@ -473,12 +591,16 @@ class ModelLink:
     """Link with the Model as the dongle, for whole subcommands."""
 
     linked = True
+    version = sc2.PROTOCOL_VERSION
+    made = []
 
     def __init__(self, dongle_nodes):
-        self.dongle = sc2.Model(counter=200, linked=self.linked)
+        self.dongle = sc2.Model(counter=200, linked=self.linked,
+                                version=self.version)
         self.acks = ModelAcks(self.dongle)
         self.round_trips_ns = []
         self.resends = 0
+        self.made.append(self)
 
     def close(self):
         pass
@@ -507,47 +629,29 @@ class ModelLink:
 
 
 class RecordingDongle(sc2.Model):
-    """The Model, logging (time, report) for each report it relays to the
-    controller and (time, None) where a session starts or ends, which stops
-    rumble."""
+    """The Model, logging (time, report) for each report it queues for the
+    controller."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.clock = 0.0
         self.log = []
 
-    def word(self, word):
-        active = self.active
-        outcome = super().word(word)
-        if not (active or outcome.accepted or outcome.copy):
-            self.log.append((self.clock, sc2.report_rumble(
-                (word >> 8) * 257, (word & 0xFF) * 257)))
-        if self.active and not active:
-            self.log.append((self.clock, None))
-        return outcome
-
-    def end_session(self):
-        self.log.append((self.clock, None))
-        super().end_session()
-
-    def _run(self, last):
-        if sc2.opcode_of(self.head) != sc2.OP_CONTROL:
-            self.log.append(
-                (self.clock, sc2.build_report(self.head, self.payload)))
-        return super()._run(last)
+    def _relay(self, report):
+        queued = len(self.relayed)
+        super()._relay(report)
+        self.log += [(self.clock, entry) for entry in self.relayed[queued:]]
 
 
 class TimedLink(ModelLink):
     """ModelLink over a RecordingDongle, each word taking one resend timeout
     and each listen or silence its length."""
 
-    made = []
-
     def __init__(self, dongle_nodes):
         super().__init__(dongle_nodes)
-        self.dongle = RecordingDongle(counter=200, linked=self.linked)
+        self.dongle = RecordingDongle(counter=200, linked=self.linked,
+                                      version=self.version)
         self.acks = ModelAcks(self.dongle)
-        self.made.append(self)
 
     def quiet(self, seconds):
         self.dongle.clock += seconds
@@ -595,13 +699,11 @@ def effect_seconds(report):
 def effects(log):
     """(report, seconds) for each report in a RecordingDongle's log."""
     for index, (start, report) in enumerate(log):
-        if report is None:
-            continue
         if report[0] != 0x80:
             yield report, effect_seconds(report)
         elif report[1]:
             ends = [time for time, later in log[index + 1:]
-                    if later is None or later[0] == 0x80]
+                    if later[0] == 0x80]
             yield report, (ends[0] - start + RUMBLE_HOLD_S if ends
                            else math.inf)
 
@@ -628,19 +730,27 @@ class Effects(unittest.TestCase):
         on, off = sc2.report_rumble(1, 0), sc2.report_rumble(0, 0)
         self.assertEqual(list(effects([(1.0, on), (1.5, off)])),
                          [(on, 0.5 + RUMBLE_HOLD_S)])
-        self.assertEqual(list(effects([(1.0, on), (1.25, None)])),
-                         [(on, 0.25 + RUMBLE_HOLD_S)])
         self.assertEqual(list(effects([(1.0, on)])), [(on, math.inf)])
+        # A session edge stops it with its own 0x80.
+        dongle = RecordingDongle()
+        run(dongle, sc2.HELLO)
+        send(dongle, sc2.encode_rumble(1, 0))
+        dongle.clock = 0.25
+        send(dongle, [sc2.BYE])
+        self.assertEqual([seconds for report, seconds in effects(dongle.log)
+                          if report[0] == 0x80],
+                         [0.25 + RUMBLE_HOLD_S])
 
 
 class Subcommands(unittest.TestCase):
     """Each subcommand from argv to exit code, the Model as the dongle."""
 
-    def run_main(self, *argv, linked=True, base=ModelLink):
+    def run_main(self, *argv, linked=True, base=ModelLink,
+                 version=sc2.PROTOCOL_VERSION):
         nodes = types.SimpleNamespace(
             prefix="usb-test", xpad=types.SimpleNamespace(path="/x"),
             pads=types.SimpleNamespace(path="/p"))
-        link = type("Link", (base,), {"linked": linked})
+        link = type("Link", (base,), {"linked": linked, "version": version})
         output = io.StringIO()
         with mock.patch.object(sc2, "choose_dongle", return_value=nodes), \
                 mock.patch.object(sc2, "controller_linked",
@@ -683,6 +793,28 @@ class Subcommands(unittest.TestCase):
             self.assertEqual(code, 0, output)
         code, output = self.run_main("mode", "14")
         self.assertEqual(code, 1, output)
+
+    def test_send_refuses_another_version(self):
+        ModelLink.made.clear()
+        code, output = self.run_main("send", "command", "5", "2", "-10",
+                                     version=1)
+        self.assertEqual(code, 1, output)
+        self.assertIn("protocol version 1, this tool version 2", output)
+        # Refused at the first HELLO word's acknowledgement.
+        dongle = ModelLink.made[0].dongle
+        self.assertEqual((dongle.counter, dongle.hello, dongle.relayed),
+                         (201, 1, []))
+
+    def test_selftest_refuses_another_version(self):
+        ModelLink.made.clear()
+        with self.assertRaises(SystemExit) as raised:
+            self.run_main("selftest", version=1)
+        self.assertIn("protocol version 1, this tool version 2",
+                      str(raised.exception.code))
+        # Only the plain rumble sent before the HELLO reached the relay.
+        dongle = ModelLink.made[0].dongle
+        self.assertFalse(dongle.active)
+        self.assertEqual({report[0] for report in dongle.relayed}, {0x80})
 
 
 class Discovery(unittest.TestCase):

@@ -485,7 +485,7 @@ answers on the pads node:
 | 15..8 | accepted words, mod 256 |
 | 7 | session active |
 | 6..4 | payload words the parser still expects; outside a session, HELLO words still to come |
-| 3..0 | protocol version, `1`, read from an acknowledgement: before the first word the node can still show 0 |
+| 3..0 | protocol version, `2`, read from an acknowledgement: before the first word the node can still show 0. A client sends no message to a dongle of another version: version 1 had a two-bit side in 9..8 and COMMAND's command in 12..10 |
 
 Each accepted word sends a pads report. The counter changes with every one, so each acceptance is a new evdev
 frame even when `ACK_ECHO` repeats; the other pads reports carry the same values. Plain rumble is never
@@ -530,51 +530,54 @@ PLAIN ────────────────────────�
 - In a session every word goes to the parser. RUMBLE speeds are relayed verbatim, without the rumble style
   and strength.
 - A word the parser rejects (a reserved opcode, an undefined CONTROL sub or argument, a non-zero unused header
-  bit, a non-zero unused bit of a narrow payload field) ends the session. It is acknowledged with the session
-  bit clear and then counts as a word outside the session, a knock step or the first HELLO word, but is never
-  relayed. A HELLO inside a session is a copy or a rejected word, depending on the toggle.
+  bit, a side of 6 or 7, a non-zero unused bit of a narrow payload field) ends the session. It is acknowledged
+  with the session bit clear and then counts as a word outside the session, a knock step or the first HELLO
+  word, but is never relayed. A HELLO inside a session is a copy or a rejected word, depending on the toggle.
 - 500 ms without a word ends a session; an idle client sends NOP every 200 ms. A restarting client waits 500 ms
   of silence before its HELLO, which also clears a parser left mid-message. Ending drops a partial message.
-- Starting and ending a session send the `0x80` zero as a stop burst, which ends rumble, stray plain rumble
-  included, then `82 03 00 00` (OFF, `HAPTIC_TYPE_OFF` in SDL's `controller_structs.h`) three times, since the
-  relay is not acknowledged. That OFF was meant for both pads, but side 3 of `0x82` is the left internal
-  actuator (sides below), and on a controller it did not end a running pulse train on a pad. A pulse train,
-  tone, sweep or script a client starts can outlive its session.
+- Starting and ending a session (BYE, a rejected word, the timeout, a reboot) send the stop: the `0x80`
+  zero, three times when rumble was on, which ends rumble, stray plain rumble included; then
+  `81 02 01 00 01 00 01 00` (one 1 µs pulse on both pads), `82 02 00 00` and `82 05 00 00` (OFF,
+  `HAPTIC_TYPE_OFF` in SDL's `controller_structs.h`, on both pads and on both grip actuators), the three in
+  turn three times, since the relay is not acknowledged. On a controller a `0x81` or an OFF on the side of a
+  running pulse train ended it, an OFF on another side (`82 03 00 00`) did not. Whether OFF ends a tone, sweep
+  or script is not measured, so those can still outlive a session.
 - While the last RUMBLE is non-zero the dongle resends its `0x80` every 40 ms, as SDL does: the controller
   stops a rumble that is not refreshed within about 50 ms.
 - The last word of a message that queues a report is accepted only while the controller's relay ring has room
-  for a session's stop (6 entries). A full ring therefore delays the acknowledgement, and the client's resend
-  retries. Without a linked controller the word is accepted and its report dropped.
+  for a session's stop (12 of its 31 entries). A full ring therefore delays the acknowledgement, and the
+  client's resend retries. Without a linked controller the word is accepted and its report dropped.
 
 **Messages.** The bits below are data bits 14..0. A header with bit 14 set is a COMMAND; otherwise bits 13..11
 are the opcode. Unused bits are zero. Payload words follow the header. A 16-bit field travels as its bits
 14..0 in its own payload word and its bit 15 (`hi`) in the header or a last payload word. Inside a message
 every word is payload: a single-word message cannot interrupt a longer one and waits until it is complete.
-Gains are s8 dB. Report fields are little-endian. `side` names actuators differently per report:
+Gains are s8 dB. Report fields are little-endian. `side`, header bits 10..8, names actuators differently per
+report:
 
 - `0x81`: 0 right pad, 1 left pad, 2 both pads (Linux `drivers/hid/hid-steam.c`: "Left and right are swapped on
-  this report for legacy reasons").
-- `0x82` to `0x85`: 0 left pad, 1 right pad, 2 both pads, 3 left internal actuator, 4 right internal actuator,
-  5 both internal actuators. Reverse engineered, not from Valve: mwdmwd/sc26re reconstructs the stock firmware,
-  and reads sides 3 to 5 of `0x81` the same way.
-- The two side bits reach 0 to 3, so no side is silent. SDL's `0x01 = L, 0x02 = R, 0x03 = Both` belongs to the
-  feature command `MsgTriggerHaptic`, not to these reports.
+  this report for legacy reasons"). 3 to 5 are unmeasured; mwdmwd/sc26re reads them as for `0x82` to `0x85`.
+- `0x82` to `0x85`: 0 left pad, 1 right pad, 2 both pads, 3 left grip actuator, 4 right grip actuator, 5 both
+  grip actuators. 0 to 3 were felt on a controller (3 with a tone), 4 and 5 follow mwdmwd/sc26re, which
+  reconstructs the stock firmware.
+- 6 and 7 name no actuator: a header with either is rejected. SDL's `0x01 = L, 0x02 = R, 0x03 = Both` belongs to
+  the feature command `MsgTriggerHaptic`, not to these reports.
 
 | Op | Name | Header bits | Payload words | Words | Report sent |
 |---|---|---|---|---|---|
-| bit 14 | COMMAND | 12..10 command, 9..8 side, 7..0 gain | none | 1 | `82 side command gain` |
+| bit 14 | COMMAND | 13..11 command, 10..8 side, 7..0 gain | none | 1 | `82 side command gain` |
 | 0 | CONTROL | 10..8 sub, 7..0 argument | per sub | 1, 2 | none |
-| 1 | SCRIPT | 9..8 side, 7..0 gain | script id (7..0) | 2 | `85 side script gain` |
+| 1 | SCRIPT | 10..8 side, 7..0 gain | script id (7..0) | 2 | `85 side script gain` |
 | 2 | RUMBLE | 2 stop, 1 left hi, 0 right hi | left speed, right speed; none for a stop | 3, 1 | `80 type intensity left 00 right 00` |
-| 3 | PULSE | 9..8 side, 2 on hi, 1 off hi, 0 repeat hi | on µs, off µs, repeat | 4 | `81 side on off repeat` |
-| 4 | SWEEP | 9..8 side, 7..0 gain | duration ms, start Hz, end Hz, then 2 duration hi, 1 start hi, 0 end hi | 5 | `84 side gain duration start end` |
-| 5 | TONE | 9..8 side, 7..0 gain | frequency Hz, duration ms, LFO Hz, then 10 frequency hi, 9 duration hi, 8 LFO hi, 7..0 LFO depth | 5 | `83 side gain frequency duration lfo depth` |
+| 3 | PULSE | 10..8 side, 2 on hi, 1 off hi, 0 repeat hi | on µs, off µs, repeat | 4 | `81 side on off repeat` |
+| 4 | SWEEP | 10..8 side, 7..0 gain | duration ms, start Hz, end Hz, then 2 duration hi, 1 start hi, 0 end hi | 5 | `84 side gain duration start end` |
+| 5 | TONE | 10..8 side, 7..0 gain | frequency Hz, duration ms, LFO Hz, then 10 frequency hi, 9 duration hi, 8 LFO hi, 7..0 LFO depth | 5 | `83 side gain frequency duration lfo depth` |
 | 6, 7 | reserved | | | | rejected |
 
-COMMAND takes bit 14 alone so that its 13 bits fit one word. SWEEP needs a fifth word: its 58 bits do not fit a
-header and three payload words. RUMBLE builds `0x80` as Xbox mode does: type 4, or 0 with both speeds zero;
-intensity the larger speed; both gains 0. Example: a click on both pads at −10 dB is COMMAND data `0x4AF6`,
-report `82 02 02 F6`.
+COMMAND takes bit 14 alone so that its 14 bits fit one word, which leaves it no unused bit. SWEEP needs a fifth
+word: its 59 bits do not fit a header and three payload words. RUMBLE builds `0x80` as Xbox mode does: type 4, or
+0 with both speeds zero; intensity the larger speed; both gains 0. Example: a click on both pads at −10 dB is
+COMMAND data `0x52F6`, report `82 02 02 F6`.
 
 | CONTROL sub | Name | Argument | Payload | Effect |
 |---|---|---|---|---|
@@ -585,16 +588,16 @@ report `82 02 02 F6`.
 | `0x06` | MODE | mode number | `0x4D00` \| mode | stores the mode as panel `0x03` does and reboots into it; rejected for an invalid mode |
 
 The rebooting commands act only on their confirmation word, so a client that lost count cannot reboot the
-dongle with one stray word. The dongle acknowledges the confirmation, stops every haptic, and reboots 50 ms
+dongle with one stray word. The dongle acknowledges the confirmation, stops every haptic, and reboots 150 ms
 later. A build with `OPK_SC2LINK_FORCE` boots into SC2 Link whatever mode was stored.
 
 CHECKSUM is a test aid. Its acknowledgement advances the counter as usual, but `ACK_ECHO` holds the
 CRC-16/CCITT-FALSE (polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR; Python's
 `binascii.crc_hqx(data, 0xFFFF)`) of the report the last report-building message queued for the controller,
-report id included: `82 02 02 F6` for the example above. A session end counts with its OFF report, `82 03 00
-00`, so a new session's CHECKSUM shows whether the last one's stop was queued; the stop at a session's start and
-RUMBLE resends leave it alone. It is `0xFFFF` (the CRC of nothing) when that report was not queued, for
-instance with no controller linked. A host compares it with the CRC of the report it expects.
+report id included: `82 02 02 F6` for the example above. A session end counts with the last report of its stop,
+`82 05 00 00`, so a new session's CHECKSUM shows whether the last one's stop was queued; the stop at a session's
+start and RUMBLE resends leave it alone. It is `0xFFFF` (the CRC of nothing) when that report was not queued,
+for instance with no controller linked. A host compares it with the CRC of the report it expects.
 
 `tools/sc2link/sc2link_test.py` speaks this protocol from a Linux host: decoded nodes, single messages,
 a selftest of every message and rule whose effects each end within a second, and the reboot commands
