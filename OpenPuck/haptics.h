@@ -173,6 +173,9 @@ void hapticRumbleReport(uint16_t left, uint16_t right,
 // Relays a 0x80 payload as built. The rumble gates, the stop burst and the
 // stuck-rumble watchdog apply, the style and scale of hapticSteamRumble do not.
 bool hapticRumbleQueue(const uint8_t p[HAPTIC_RUMBLE_LEN], uint8_t slot);
+// Whether the last 0x80 queued for the slot was on: until a zero follows it,
+// rumble can still be running.
+bool hapticRumbleOn(uint8_t slot);
 
 // queue + flush the pending host/test/stop relay inside the poll cadence (called from rf_link).
 // rfConnFlushRelay's s1 must carry a PID distinct from the GET poll that follows it. g_relayPid

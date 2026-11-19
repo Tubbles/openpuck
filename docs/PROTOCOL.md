@@ -535,18 +535,43 @@ PLAIN ────────────────────────�
   word, but is never relayed. A HELLO inside a session is a copy or a rejected word, depending on the toggle.
 - 500 ms without a word ends a session; an idle client sends NOP every 200 ms. A restarting client waits 500 ms
   of silence before its HELLO, which also clears a parser left mid-message. Ending drops a partial message.
-- Starting and ending a session (BYE, a rejected word, the timeout, a reboot) send the stop: the `0x80`
-  zero, three times when rumble was on, which ends rumble, stray plain rumble included; then
-  `81 02 01 00 01 00 01 00` (one 1 µs pulse on both pads), `82 02 00 00` and `82 05 00 00` (OFF,
-  `HAPTIC_TYPE_OFF` in SDL's `controller_structs.h`, on both pads and on both grip actuators), the three in
-  turn three times, since the relay is not acknowledged. On a controller a `0x81` or an OFF on the side of a
-  running pulse train ended it, an OFF on another side (`82 03 00 00`) did not. Whether OFF ends a tone, sweep
-  or script is not measured, so those can still outlive a session.
+- Starting and ending a session (BYE, a rejected word, the timeout, a reboot) send the stop (below).
 - While the last RUMBLE is non-zero the dongle resends its `0x80` every 40 ms, as SDL does: the controller
   stops a rumble that is not refreshed within about 50 ms.
 - The last word of a message that queues a report is accepted only while the controller's relay ring has room
-  for a session's stop (12 of its 31 entries). A full ring therefore delays the acknowledgement, and the
-  client's resend retries. Without a linked controller the word is accepted and its report dropped.
+  for a session's stop (15 of its 31 entries, with rumble on and every class running). A full ring therefore
+  delays the acknowledgement, and the client's resend retries. Without a linked controller the word is
+  accepted and its report dropped.
+
+**Stop.** It ends what this dongle relayed that can still be running and sends nothing else, since each stop
+report is itself felt, a tick on the trackpads. It sends, of `81 02 01 00 01 00 01 00` (one 1 µs pulse on both
+pads), `82 02 00 00` (OFF, `HAPTIC_TYPE_OFF` in SDL's `controller_structs.h`, on both pads),
+`81 05 01 00 01 00 01 00` and `82 05 00 00` (the same on both grip actuators), those of the classes it is for,
+in this order, the list three times since the relay is not acknowledged. Ahead of them goes the `0x80` zero,
+once, or three times while the last `0x80` queued was on; while it was on the zero goes out even with no
+class, which ends rumble, stray plain rumble included. A stop is for the classes that can still run, and for
+those the previous stop was for while they could: one radio fade can take every copy of a stop, so each one is
+repeated once at the next session edge, also when a report of the class was queued in between, because a
+new effect on one side does not end an older one on another. A class can run until the latest end of its reports' effects, each counted from when
+the dongle queued it, plus 150 ms for a full relay ring to reach the controller; a stop that went out for it
+ends that time. The times live in RAM across sessions and are empty after a reboot, so a session that played
+nothing starts and ends without a report, and the session edge after one that stopped something repeats that
+stop.
+
+| Class | Reports | Runs for | Stop reports |
+|---|---|---|---|
+| pad pulse | `0x81`, sides 0 to 2 | (on + off) × repeat µs, a repeat of 0 counted as 1; nothing with on 0 | `81 02`, `82 02` |
+| grip pulse | `0x81`, sides 3 to 5 | as pad pulse | `81 05`, `82 05` |
+| pad tone | `0x83`, `0x84` and `0x82` commands 3 to 7, sides 0 to 2 | the duration; until a stop for 0 ms and for the commands | `81 02`, `82 02` |
+| grip tone | as pad tone, sides 3 to 5 | as pad tone | `81 05`, `82 05` |
+
+`0x82` OFF, tick and click (18 and 24 ms) need no stop, and none ends a `0x85` script. Commands 3 to 7 are
+undefined for `0x82`, but a host decodes 3, 6 and 7 like a tone, a script and a sweep, of no known length. On a
+controller the `0x81` or the OFF on the side of a running pulse train ended it alone, an OFF on another side
+(`82 03 00 00`) did not, and the `0x80` zero, the two pad reports and `82 05 00 00` together ended trains on
+the pads and on both grips and a tone and a sweep on a pad. Which report ended the tone, the sweep and the grip
+train is not known, hence the pairs and the zero ahead of every stop that sends a report. `81 05` and the grip
+tone class are unmeasured.
 
 **Messages.** The bits below are data bits 14..0. A header with bit 14 set is a COMMAND; otherwise bits 13..11
 are the opcode. Unused bits are zero. Payload words follow the header. A 16-bit field travels as its bits
@@ -588,16 +613,18 @@ COMMAND data `0x52F6`, report `82 02 02 F6`.
 | `0x06` | MODE | mode number | `0x4D00` \| mode | stores the mode as panel `0x03` does and reboots into it; rejected for an invalid mode |
 
 The rebooting commands act only on their confirmation word, so a client that lost count cannot reboot the
-dongle with one stray word. The dongle acknowledges the confirmation, stops every haptic, and reboots 150 ms
-later. A build with `OPK_SC2LINK_FORCE` boots into SC2 Link whatever mode was stored.
+dongle with one stray word. The dongle acknowledges the confirmation, sends the session's stop, and reboots
+150 ms later. A build with `OPK_SC2LINK_FORCE` boots into SC2 Link whatever mode was stored.
 
 CHECKSUM is a test aid. Its acknowledgement advances the counter as usual, but `ACK_ECHO` holds the
 CRC-16/CCITT-FALSE (polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR; Python's
 `binascii.crc_hqx(data, 0xFFFF)`) of the report the last report-building message queued for the controller,
-report id included: `82 02 02 F6` for the example above. A session end counts with the last report of its stop,
-`82 05 00 00`, so a new session's CHECKSUM shows whether the last one's stop was queued; the stop at a session's
-start and RUMBLE resends leave it alone. It is `0xFFFF` (the CRC of nothing) when that report was not queued,
-for instance with no controller linked. A host compares it with the CRC of the report it expects.
+report id included: `82 02 02 F6` for the example above. A session end counts with the last report its stop
+queued, so a new session's CHECKSUM shows what the last one's stop sent: `82 05 00 00` when it was for a grip
+class, else `82 02 00 00` when it was for a pad class, else the `0x80` zero when only rumble was on, and none
+when it sent nothing. The stop at a session's start and RUMBLE resends leave it alone. It is `0xFFFF` (the CRC
+of nothing) when no report was queued: a stop that sent nothing, or no controller linked. A host compares it
+with the CRC of the report it expects.
 
 `tools/sc2link/sc2link_test.py` speaks this protocol from a Linux host: decoded nodes, single messages,
 a selftest of every message and rule whose effects each end within a second, and the reboot commands

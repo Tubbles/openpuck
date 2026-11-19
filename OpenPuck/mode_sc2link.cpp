@@ -64,26 +64,58 @@ SC2LinkController g_sc2LinkCtl;
 #define SC2_SIDE_BOTH_GRIPS 5
 #define SC2_SIDE_MAX 5
 
-struct Sc2Report {
+// 0x82 commands: 0 OFF, 1 tick, 2 click. Tick and click are fixed 18 and
+// 24 ms waveforms.
+#define SC2_CMD_CLICK 2
+
+// The classes of effect a stop tells apart, as bits: 0x81 on the pads and on
+// the grips, and a tone, a sweep or an undefined 0x82 command on each.
+#define SC2_PAD_PULSE 0x01
+#define SC2_GRIP_PULSE 0x02
+#define SC2_PAD_TONE 0x04
+#define SC2_GRIP_TONE 0x08
+#define SC2_CLASSES 4
+// A queued report reaches the controller within a full relay ring (31
+// entries, one per 4 ms RF poll), so its effect can start that much later.
+#define SC2_RADIO_MARGIN_MS 150u
+#define SC2_UNTIL_STOPPED 0xFFFFFFFFu
+
+struct Sc2Stop {
+	// The classes it is sent for.
+	uint8_t classes;
 	uint8_t length;
 	uint8_t bytes[SC2_REPORT_MAX];
 };
 
-// What a session's start and end queue after the rumble stop burst, in this
-// order, the whole list RUMBLE_STOP_REPS times since the relay is not
-// acknowledged. On a controller (2026-11-19) a 0x81 or a 0x82 OFF on a running
-// 0x81 train's pad ended the train, an OFF on another side did not. Whether
-// OFF ends a tone, sweep or script is not measured. tools/sc2link/
-// test_sc2link.py reads this table: plain numbers and SC2_SIDE_* only.
-static const Sc2Report SC2_STOP[] = {
+// What a session's start and end queue after the 0x80 zero, in this order,
+// the whole list RUMBLE_STOP_REPS times since the relay is not acknowledged.
+// Each entry is felt, a tick on the trackpads even with nothing to end
+// (2026-11-19), so one goes out only for a class it is sent for. On a
+// controller (2026-11-19) the 0x81 or the OFF on a pad train's own side ended
+// it alone, an OFF on another side did not, and the 0x80 zero, the two pad
+// entries and the grip OFF together ended trains on the pads and on both
+// grips and a tone and a sweep on a pad. Which report ended the tone, the
+// sweep and the grip train is not known, hence the pairs and the zero in
+// front of every stop that sends an entry. The grip 0x81 and the grip tone
+// class are unmeasured. tools/sc2link/test_sc2link.py reads this table: plain
+// numbers, SC2_SIDE_* and ORed classes only.
+static const Sc2Stop SC2_STOP[] = {
 	// 0x81 on both pads: on 1 us, off 1 us, repeat 1
-	{ 8, { 0x81, SC2_SIDE_BOTH_PADS, 1, 0, 1, 0, 1, 0 } },
+	{ SC2_PAD_PULSE | SC2_PAD_TONE,
+	  8,
+	  { 0x81, SC2_SIDE_BOTH_PADS, 1, 0, 1, 0, 1, 0 } },
 	// 0x82 OFF (command 0, HAPTIC_TYPE_OFF in SDL's controller_structs.h)
-	{ 4, { 0x82, SC2_SIDE_BOTH_PADS, 0, 0 } },
-	{ 4, { 0x82, SC2_SIDE_BOTH_GRIPS, 0, 0 } },
+	{ SC2_PAD_PULSE | SC2_PAD_TONE, 4, { 0x82, SC2_SIDE_BOTH_PADS, 0, 0 } },
+	{ SC2_GRIP_PULSE | SC2_GRIP_TONE,
+	  8,
+	  { 0x81, SC2_SIDE_BOTH_GRIPS, 1, 0, 1, 0, 1, 0 } },
+	{ SC2_GRIP_PULSE | SC2_GRIP_TONE,
+	  4,
+	  { 0x82, SC2_SIDE_BOTH_GRIPS, 0, 0 } },
 };
 static const uint8_t SC2_STOP_REPORTS = sizeof SC2_STOP / sizeof SC2_STOP[0];
-// Relay entries one stop takes at most: a rumble stop burst and the list.
+// Relay entries one stop takes at most, with rumble on and every class sent
+// for: the 0x80 zero burst and the list.
 #define SC2_STOP_ENTRIES ((1 + SC2_STOP_REPORTS) * RUMBLE_STOP_REPS)
 
 // A header with data bit 14 set is a COMMAND, whose 14 bits fill the word and
@@ -347,13 +379,29 @@ struct Sc2Session {
 	uint8_t rumble[HAPTIC_RUMBLE_LEN];
 	bool rumbleOn;
 	unsigned long rumbleMs;
-	// The report the last report-building message or session end queued,
-	// for CHECKSUM. Length 0 when it was dropped.
+	// The report the last report-building message queued, or the last one
+	// a session end's stop queued, for CHECKSUM. Length 0 when it was
+	// dropped or the stop queued none.
 	uint8_t report[SC2_REPORT_MAX];
 	uint8_t reportLength;
 };
 
 static Sc2Session g_sc2Session;
+
+// Loop only, per class: when its last effect was queued and how long it can
+// run from then, the radio margin included. 0 when it cannot,
+// SC2_UNTIL_STOPPED until a stop goes out for it. Kept across sessions, and
+// empty after a boot.
+struct Sc2Running {
+	unsigned long fromMs;
+	uint32_t forMs;
+};
+static Sc2Running g_sc2Running[SC2_CLASSES];
+// Loop only: the classes the last stop was sent for while they could run. The
+// next stop sends theirs once more, since one radio fade can take every copy
+// of a stop, unless a new effect of the class came in between.
+static uint8_t g_sc2Repeat;
+
 // Loop only: the latest plain rumble word, relayed once per loop.
 static uint16_t g_sc2PlainWord;
 static bool g_sc2PlainPending;
@@ -905,6 +953,103 @@ static bool sc2CanComplete(uint16_t header)
 	return sc2Op(header) == SC2_OP_CONTROL || sc2RelayRoom();
 }
 
+static uint16_t sc2Read16(const uint8_t *bytes)
+{
+	return (uint16_t)(bytes[0] | bytes[1] << 8);
+}
+
+// A 0x81 train plays on + off us, repeat times; in ms rounded up. One without
+// on time plays nothing (on a controller it ended a running train), one
+// without a repeat is taken to play once. The product needs 64 bits.
+static uint32_t sc2PulseMs(const uint8_t *report)
+{
+	uint32_t on = sc2Read16(report + 2);
+	uint32_t off = sc2Read16(report + 4);
+	uint32_t repeat = sc2Read16(report + 6);
+	if (!on)
+		return 0;
+	uint64_t us = (uint64_t)(on + off) * (repeat ? repeat : 1);
+	return (uint32_t)((us + 999) / 1000);
+}
+
+// How long the effect of a queued report can run, in ms from now without the
+// margin, SC2_UNTIL_STOPPED with no end known, 0 when no stop is for it: 0x80
+// has a stop of its own, and none ends a 0x85 script (measured).
+static uint32_t sc2PlayMs(const uint8_t *report)
+{
+	uint16_t duration;
+	switch (report[0]) {
+	case 0x81:
+		return sc2PulseMs(report);
+	case 0x82:
+		// Undefined for 0x82, but a host decodes 3, 6 and 7 like a
+		// tone, a script and a sweep, of no known length.
+		return report[2] > SC2_CMD_CLICK ? SC2_UNTIL_STOPPED : 0;
+	case 0x83:
+	case 0x84:
+		// A tone of 0 ms plays until stopped (mwdmwd/sc26re), and a
+		// sweep of 0 ms is taken to as well.
+		duration = sc2Read16(report + (report[0] == 0x83 ? 5 : 3));
+		return duration ? duration : SC2_UNTIL_STOPPED;
+	default:
+		return 0;
+	}
+}
+
+static uint8_t sc2Class(const uint8_t *report)
+{
+	bool grips = report[1] > SC2_SIDE_BOTH_PADS;
+	if (report[0] == 0x81)
+		return grips ? SC2_GRIP_PULSE : SC2_PAD_PULSE;
+	return grips ? SC2_GRIP_TONE : SC2_PAD_TONE;
+}
+
+// Clears the classes past their time. task() runs this every loop, so no time
+// ages into a millis() wrap.
+static void sc2ExpireRunning(unsigned long now)
+{
+	for (uint8_t c = 0; c < SC2_CLASSES; c++) {
+		Sc2Running &running = g_sc2Running[c];
+		if (running.forMs != SC2_UNTIL_STOPPED &&
+		    now - running.fromMs >= running.forMs)
+			running.forMs = 0;
+	}
+}
+
+static uint8_t sc2RunningClasses(void)
+{
+	uint8_t classes = 0;
+	for (uint8_t c = 0; c < SC2_CLASSES; c++)
+		if (g_sc2Running[c].forMs)
+			classes |= (uint8_t)(1u << c);
+	return classes;
+}
+
+// Makes a class run at least `ms` from now. A shorter effect after a longer
+// one leaves the longer end.
+static void sc2Extend(Sc2Running &running, uint32_t ms, unsigned long now)
+{
+	uint32_t elapsed = now - running.fromMs;
+	uint32_t left = elapsed < running.forMs ? running.forMs - elapsed : 0;
+	if (running.forMs == SC2_UNTIL_STOPPED || ms <= left)
+		return;
+	running.fromMs = now;
+	running.forMs = ms;
+}
+
+static void sc2NoteRunning(const uint8_t *report, unsigned long now)
+{
+	uint32_t ms = sc2PlayMs(report);
+	uint8_t bit = sc2Class(report);
+	if (!ms)
+		return;
+	if (ms != SC2_UNTIL_STOPPED)
+		ms += SC2_RADIO_MARGIN_MS;
+	for (uint8_t c = 0; c < SC2_CLASSES; c++)
+		if (bit == 1u << c)
+			sc2Extend(g_sc2Running[c], ms, now);
+}
+
 // RUMBLE speeds go out verbatim: Steam has shaped them already. The rest is
 // gated like Steam's own reports in the puck mode.
 static bool sc2QueueReport(const uint8_t *report, uint8_t length)
@@ -921,57 +1066,78 @@ static bool sc2QueueReport(const uint8_t *report, uint8_t length)
 	uint8_t bond = (uint8_t)g_sc2Bond;
 	if (rumble)
 		return hapticRumbleQueue(session.rumble, bond);
-	return !haptic82Blocked(bond) &&
-	       relayEnqueue(report[0], report + 1, (uint8_t)(length - 1), true,
-			    bond);
+	if (haptic82Blocked(bond) ||
+	    !relayEnqueue(report[0], report + 1, (uint8_t)(length - 1), true,
+			  bond))
+		return false;
+	sc2NoteRunning(report, millis());
+	return true;
 }
 
-// The rumble of 0x80 and, through SC2_STOP, the pulses and whatever else its
-// reports end. A stop passes the gates a stop of plain rumble passes. True
-// when SC2_STOP was queued.
-static bool sc2StopHaptics(void)
+// Ends what can still run: the classes that can, and those of g_sc2Repeat,
+// with their SC2_STOP entries after the 0x80 zero, rumble alone with the zero.
+// hapticRumbleQueue bursts the zero while rumble is on. Nothing goes out when
+// nothing can run. A stop passes the gates a stop of plain rumble passes.
+// Returns the length of the last report it queued, copied to `last`, 0 for
+// none.
+static uint8_t sc2StopHaptics(uint8_t last[SC2_REPORT_MAX])
 {
 	g_sc2Session.rumbleOn = false;
 	if (g_sc2Bond < 0)
-		return false;
+		return 0;
 	uint8_t bond = (uint8_t)g_sc2Bond;
-	uint8_t stop[HAPTIC_RUMBLE_LEN];
-	hapticRumbleReport(0, 0, stop);
-	hapticRumbleQueue(stop, bond);
+	uint8_t length = 0;
+	sc2ExpireRunning(millis());
+	uint8_t running = sc2RunningClasses();
+	uint8_t classes = running | g_sc2Repeat;
+	if (classes || hapticRumbleOn(bond)) {
+		last[0] = 0x80;
+		hapticRumbleReport(0, 0, last + 1);
+		if (hapticRumbleQueue(last + 1, bond))
+			length = 1 + HAPTIC_RUMBLE_LEN;
+	}
 	if (!hapticLinkUp(bond))
-		return false;
-	bool queued = false;
-	for (uint8_t rep = 0; rep < RUMBLE_STOP_REPS; rep++)
-		for (uint8_t i = 0; i < SC2_STOP_REPORTS; i++)
-			if (relayEnqueue(SC2_STOP[i].bytes[0],
-					 SC2_STOP[i].bytes + 1,
-					 (uint8_t)(SC2_STOP[i].length - 1),
-					 true, bond))
-				queued = true;
-	return queued;
+		return length;
+	for (uint8_t rep = 0; rep < RUMBLE_STOP_REPS; rep++) {
+		for (uint8_t i = 0; i < SC2_STOP_REPORTS; i++) {
+			const Sc2Stop &stop = SC2_STOP[i];
+			if (!(stop.classes & classes) ||
+			    !relayEnqueue(stop.bytes[0], stop.bytes + 1,
+					  (uint8_t)(stop.length - 1), true,
+					  bond))
+				continue;
+			memcpy(last, stop.bytes, stop.length);
+			length = stop.length;
+		}
+	}
+	for (uint8_t c = 0; c < SC2_CLASSES; c++)
+		if (running & 1u << c)
+			g_sc2Running[c].forMs = 0;
+	g_sc2Repeat = running;
+	return length;
 }
 
-// Stops every haptic and drops a partial message. Words are plain rumble
-// again. The last report of SC2_STOP counts for CHECKSUM, so a client can tell
-// from the next session that the stop was queued.
+// Stops what can still run and drops a partial message. Words are plain
+// rumble again. CHECKSUM then covers the last report the stop queued, none
+// when it sent nothing, so a client can tell from the next session what the
+// stop sent.
 static void sc2EndSession(void)
 {
 	Sc2Session &session = g_sc2Session;
-	const Sc2Report &last = SC2_STOP[SC2_STOP_REPORTS - 1];
 	session.active = false;
 	session.need = 0;
-	session.reportLength = sc2StopHaptics() ? last.length : 0;
-	memcpy(session.report, last.bytes, session.reportLength);
+	session.reportLength = sc2StopHaptics(session.report);
 }
 
 static void sc2StartSession(unsigned long ms)
 {
 	Sc2Session &session = g_sc2Session;
+	uint8_t unused[SC2_REPORT_MAX];
 	// Stray words before the HELLO were plain rumble at their byte values:
 	// a session starts from silence, with the same stop as its end, which
 	// leaves CHECKSUM to that end.
 	g_sc2PlainPending = false;
-	sc2StopHaptics();
+	sc2StopHaptics(unused);
 	session.active = true;
 	session.hello = 0;
 	session.need = 0;
@@ -1305,6 +1471,7 @@ void SC2LinkController::onAuxReport(int slot, uint8_t rid, const uint8_t *data,
 
 void SC2LinkController::task()
 {
+	sc2ExpireRunning(millis());
 	sc2UpdateBond();
 	sc2DrainWords();
 	sc2SessionTask();

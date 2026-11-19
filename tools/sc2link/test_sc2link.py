@@ -29,9 +29,9 @@ def firmware_source(name):
 
 
 def firmware_defines(source):
-    """The #defines of plain integers."""
+    """The #defines of plain integers, unsigned ones included."""
     return {name: int(value, 0) for name, value in
-            re.findall(r"^#define (\w+) (0x[0-9A-Fa-f]+|\d+)$", source,
+            re.findall(r"^#define (\w+) (0x[0-9A-Fa-f]+|\d+)u?$", source,
                        re.M)}
 
 
@@ -49,6 +49,10 @@ def session_model(linked=True):
     model = sc2.Model(linked=linked)
     run(model, sc2.HELLO)
     return model
+
+
+# The stop reports by report id and side: "81 02", "82 02", "81 05", "82 05".
+STOP = {report[:2].hex(" "): report for _, report in sc2.STOP_ENTRIES}
 
 
 class StructLayouts(unittest.TestCase):
@@ -205,90 +209,369 @@ class Decoder(unittest.TestCase):
         outcomes = send(model, sc2.encode_rumble(1, 2) + [sc2.CHECKSUM])
         self.assertEqual(outcomes[-1].echo, 0xFFFF)
 
-    def test_session_end_queues_the_stop(self):
-        # A message, BYE, a new session: CHECKSUM covers the last report of
-        # the end's stop, since a session start queues the same stop but
-        # leaves CHECKSUM.
-        for linked, expected in ((True, sc2.crc16(sc2.STOP_REPORTS[-1])),
+    def test_session_end_checksum(self):
+        # A grip train, BYE, a new session: CHECKSUM covers the last report
+        # of the end's stop, the grip OFF. The start leaves it alone.
+        for linked, expected in ((True, sc2.crc16(STOP["82 05"])),
                                  (False, 0xFFFF)):
             model = session_model(linked)
             send(model, sc2.encode_pulse(3, 20000, 20000, 1000) + [sc2.BYE])
             run(model, sc2.HELLO)
             self.assertEqual(send(model, [sc2.CHECKSUM])[0].echo, expected)
-            # A rejected word ends the session the same way.
+            # A tick keeps nothing running, so a rejected word's stop
+            # queues nothing: the CRC of no report.
             send(model, sc2.encode_command(1, 1, 0) + [0x3800])
             run(model, sc2.HELLO)
-            self.assertEqual(send(model, [sc2.CHECKSUM])[0].echo, expected)
+            self.assertEqual(send(model, [sc2.CHECKSUM])[0].echo, 0xFFFF)
 
     def test_crc_check_value(self):
         self.assertEqual(sc2.crc16(b"123456789"), 0x29B1)
         self.assertEqual(sc2.crc16(b""), 0xFFFF)
 
 
+RUMBLE_OFF = sc2.report_rumble(0, 0)
+
+
+def rounds(names):
+    """The stop reports named, in turn STOP_REPEATS times."""
+    return [STOP[name] for name in names] * sc2.STOP_REPEATS
+
+
+def stop(names, rumble=False):
+    """What a stop queues: the 0x80 zero, three times while rumble was on,
+    then the reports named; nothing with neither."""
+    if not names and not rumble:
+        return []
+    return [RUMBLE_OFF] * (sc2.STOP_REPEATS if rumble else 1) + rounds(names)
+
+
 class Stop(unittest.TestCase):
     """What a session's start and end queue for the controller."""
 
-    RUMBLE_OFF = sc2.report_rumble(0, 0)
-    ROUNDS = list(sc2.STOP_REPORTS) * sc2.STOP_REPEATS
+    # A message of each class that plays 400 ms: 40 ms periods, 400 ms tones.
+    PLAYS = {
+        sc2.PAD_PULSE: sc2.encode_pulse(1, 2000, 38000, 10),
+        sc2.GRIP_PULSE: sc2.encode_pulse(4, 2000, 38000, 10),
+        sc2.PAD_TONE: sc2.encode_tone(0, -10, 160, 400, 0, 0),
+        sc2.GRIP_TONE: sc2.encode_sweep(5, -10, 400, 60, 200),
+    }
+    # The stop reports each class sends.
+    SENDS = {
+        sc2.PAD_PULSE: ["81 02", "82 02"],
+        sc2.GRIP_PULSE: ["81 05", "82 05"],
+        sc2.PAD_TONE: ["81 02", "82 02"],
+        sc2.GRIP_TONE: ["81 05", "82 05"],
+    }
+    ENDS = {"BYE": lambda model: send(model, [sc2.BYE]),
+            "a rejected word": lambda model: send(model, [0x3800]),
+            "the timeout": lambda model: model.end_session()}
 
-    def test_reports(self):
-        self.assertEqual([report.hex(" ") for report in sc2.STOP_REPORTS],
-                         ["81 02 01 00 01 00 01 00", "82 02 00 00",
-                          "82 05 00 00"])
+    def play(self, data_words, clock=0.0, model=None):
+        """A session that sent the message at `clock` seconds, its relays
+        cleared."""
+        if model is None:
+            model = session_model()
+        model.clock = clock
+        send(model, data_words)
+        model.relayed.clear()
+        return model
+
+    def assert_edge(self, model, clock, names, rumble=False):
+        """BYE at `clock` seconds queues the stop of the reports named, the
+        next session's start repeats it, rumble aside, and the end after
+        that queues nothing. CHECKSUM shows each end's last report."""
+        expected = stop(names, rumble)
+        model.clock = clock
+        send(model, [sc2.BYE])
+        self.assertEqual(model.relayed, expected)
+        model.relayed.clear()
+        run(model, sc2.HELLO)
+        self.assertEqual(model.relayed, stop(names))
+        model.relayed.clear()
+        checksum = send(model, [sc2.CHECKSUM])[0].echo
+        self.assertEqual(checksum,
+                         sc2.crc16(expected[-1] if expected else b""))
+        send(model, [sc2.BYE])
+        run(model, sc2.HELLO)
+        self.assertEqual(send(model, [sc2.CHECKSUM])[0].echo, 0xFFFF)
+        self.assertEqual(model.relayed, [])
+
+    def lose_the_end(self, data_words):
+        """A session that plays at 0 s and whose end at 0.1 s finds no link,
+        so its stop is lost, then a session started at 0.2 s."""
+        model = self.play(data_words)
+        model.linked = False
+        model.clock = 0.1
+        send(model, [sc2.BYE])
+        model.linked = True
+        model.clock = 0.2
+        run(model, sc2.HELLO)
+        return model
+
+    def test_entries(self):
+        self.assertEqual([(classes, report.hex(" "))
+                          for classes, report in sc2.STOP_ENTRIES], [
+            (sc2.PAD_PULSE | sc2.PAD_TONE, "81 02 01 00 01 00 01 00"),
+            (sc2.PAD_PULSE | sc2.PAD_TONE, "82 02 00 00"),
+            (sc2.GRIP_PULSE | sc2.GRIP_TONE, "81 05 01 00 01 00 01 00"),
+            (sc2.GRIP_PULSE | sc2.GRIP_TONE, "82 05 00 00")])
         self.assertEqual(sc2.STOP_REPEATS, 3)
 
     def test_firmware_queues_the_same(self):
         source = firmware_source("mode_sc2link.cpp")
         defines = firmware_defines(source)
         table = re.search(r"SC2_STOP\[\] = \{(.*?)\n\};", source, re.S)
-        reports = []
-        for length, body in re.findall(r"\{\s*(\d+),\s*\{([^}]*)\}\s*\}",
-                                       table.group(1)):
+        entries = []
+        for classes, length, body in re.findall(
+                r"\{\s*([\w\s|]+?),\s*(\d+),\s*\{([^}]*)\}\s*\}",
+                table.group(1)):
+            mask = 0
+            for name in classes.split("|"):
+                mask |= defines[name.strip()]
             items = [item.strip() for item in body.split(",")]
             values = [defines[item] if item in defines else int(item, 0)
                       for item in items]
             self.assertEqual(len(values), int(length))
-            reports.append(bytes(values))
-        self.assertEqual(reports, list(sc2.STOP_REPORTS))
-        self.assertEqual(defines["SC2_PROTOCOL_VERSION"],
-                         sc2.PROTOCOL_VERSION)
-        self.assertEqual(defines["SC2_SIDE_MAX"], sc2.SIDE_MAX)
+            entries.append((mask, bytes(values)))
+        self.assertEqual(entries, list(sc2.STOP_ENTRIES))
+        for name, value in (("SC2_PAD_PULSE", sc2.PAD_PULSE),
+                            ("SC2_GRIP_PULSE", sc2.GRIP_PULSE),
+                            ("SC2_PAD_TONE", sc2.PAD_TONE),
+                            ("SC2_GRIP_TONE", sc2.GRIP_TONE),
+                            ("SC2_CLASSES", 4),
+                            ("SC2_RADIO_MARGIN_MS", sc2.RADIO_MARGIN_MS),
+                            ("SC2_CMD_CLICK", sc2.COMMAND_CLICK),
+                            ("SC2_SIDE_BOTH_PADS", 2),
+                            ("SC2_PROTOCOL_VERSION", sc2.PROTOCOL_VERSION),
+                            ("SC2_SIDE_MAX", sc2.SIDE_MAX)):
+            self.assertEqual(defines[name], value, name)
         haptics = firmware_defines(firmware_source("haptics.h"))
         self.assertEqual(haptics["RUMBLE_STOP_REPS"], sc2.STOP_REPEATS)
 
-    def test_every_session_edge(self):
-        ends = {"BYE": lambda model: send(model, [sc2.BYE]),
-                "a rejected word": lambda model: send(model, [0x3800]),
-                "the timeout": lambda model: model.end_session()}
-        for name, end in ends.items():
+    def test_relay_budget_holds_every_class_running(self):
+        # The firmware reserves room for a rumble stop and the whole list,
+        # each STOP_REPEATS times, and the ring holds that with a report.
+        source = firmware_source("mode_sc2link.cpp")
+        self.assertIn("#define SC2_STOP_ENTRIES ((1 + SC2_STOP_REPORTS) * "
+                      "RUMBLE_STOP_REPS)", source)
+        budget = (1 + len(sc2.STOP_ENTRIES)) * sc2.STOP_REPEATS
+        ring = firmware_defines(firmware_source("haptics.cpp"))["RELAY_QLEN"]
+        self.assertLessEqual(budget + 1, ring - 1)
+        model = self.play(sc2.encode_rumble(0x1234, 0))
+        for data_words in self.PLAYS.values():
+            self.play(data_words, model=model)
+        send(model, [sc2.BYE])
+        self.assertEqual(len(model.relayed), budget)
+        # The repeat at the next edge, without rumble, takes fewer.
+        model.relayed.clear()
+        run(model, sc2.HELLO)
+        self.assertEqual(len(model.relayed), budget - 2)
+
+    def test_the_zero_comes_with_every_stop_that_sends(self):
+        # Once with rumble off, ahead of the reports, at the stop and at its
+        # repeat; never in a stop that sends nothing.
+        for bit, data_words in self.PLAYS.items():
+            with self.subTest(bit=bit):
+                model = self.play(data_words)
+                model.clock = 0.1
+                send(model, [sc2.BYE])
+                run(model, sc2.HELLO)
+                send(model, [sc2.BYE])
+                stops = [model.relayed[:7], model.relayed[7:]]
+                self.assertEqual(stops, [stop(self.SENDS[bit])] * 2)
+                self.assertEqual(model.relayed.count(RUMBLE_OFF), 2)
+        model = session_model()
+        send(model, [sc2.BYE])
+        self.assertEqual(model.relayed, [])
+
+    def test_grip_tones_send_both_grip_reports(self):
+        for data_words in (sc2.encode_tone(3, 0, 65, 2000, 0, 0),
+                           sc2.encode_tone(4, 0, 65, 2000, 0, 0),
+                           sc2.encode_sweep(5, 0, 2000, 60, 200),
+                           sc2.encode_command(5, 6, 0)):
+            with self.subTest(words=[hex(word) for word in data_words]):
+                self.assert_edge(self.play(data_words), 1.0,
+                                 ["81 05", "82 05"])
+
+    def test_a_stop_is_repeated_at_the_next_edge_only(self):
+        # Whatever ends the session, and however long after the effect
+        # ended the next edge comes.
+        for name, end in self.ENDS.items():
+            with self.subTest(end=name):
+                model = self.play(self.PLAYS[sc2.PAD_PULSE])
+                model.clock = 0.1
+                end(model)
+                self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+                model.relayed.clear()
+                model.clock = 3600.0
+                run(model, sc2.HELLO)
+                self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+                model.relayed.clear()
+                end(model)
+                run(model, sc2.HELLO)
+                end(model)
+                self.assertEqual(model.relayed, [])
+
+    def test_a_lost_stop_goes_out_at_the_next_edge(self):
+        # The end had no link: the start stops the tone still running, and
+        # the end after it repeats that.
+        model = self.lose_the_end(self.PLAYS[sc2.PAD_TONE])
+        self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+        model.relayed.clear()
+        model.clock = 1.0
+        send(model, [sc2.BYE])
+        self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+
+    def test_a_new_effect_in_between_keeps_the_repeat(self):
+        # A new effect on one side does not end an older one on another, so
+        # the repeat stays whatever is queued after the start's stop. A new
+        # pad tone that is still running at the end is stopped as usual and
+        # the next edge repeats that.
+        model = self.lose_the_end(self.PLAYS[sc2.PAD_TONE])
+        self.play(sc2.encode_tone(1, 0, 160, 10, 0, 0), 0.3, model)
+        self.assert_edge(model, 0.45, ["81 02", "82 02"])
+        # Done by 1 s, or of another class: the end still repeats.
+        for report in (sc2.encode_tone(1, 0, 160, 10, 0, 0),
+                       sc2.encode_sweep(5, 0, 10, 60, 200)):
+            with self.subTest(report=report):
+                model = self.lose_the_end(self.PLAYS[sc2.PAD_TONE])
+                self.play(report, 0.3, model)
+                model.clock = 1.0
+                send(model, [sc2.BYE])
+                self.assertEqual(model.relayed, stop(["81 02", "82 02"]))
+
+    def test_nothing_played(self):
+        # No report at any session edge, and CHECKSUM shows none.
+        for name, end in self.ENDS.items():
             with self.subTest(end=name):
                 model = sc2.Model()
                 run(model, sc2.HELLO)
-                self.assertEqual(model.relayed,
-                                 [self.RUMBLE_OFF] + self.ROUNDS)
-                model.relayed.clear()
+                send(model, [sc2.NOP])
                 end(model)
                 self.assertFalse(model.active)
-                self.assertEqual(model.relayed,
-                                 [self.RUMBLE_OFF] + self.ROUNDS)
+                run(model, sc2.HELLO)
+                self.assertEqual(send(model, [sc2.CHECKSUM])[0].echo, 0xFFFF)
+                self.assertEqual(model.relayed, [])
+
+    def test_reports_that_keep_nothing_running(self):
+        # OFF, tick, click, a train without on time, a script and rumble
+        # that was switched off again need no stop.
+        for data_words in (sc2.encode_command(2, 0, 0),
+                           sc2.encode_command(5, 1, -10),
+                           sc2.encode_command(2, 2, -10),
+                           sc2.encode_pulse(2, 0, 0xFFFF, 0xFFFF),
+                           sc2.encode_script(2, 13, -10),
+                           sc2.encode_rumble(0x1234, 0)
+                           + sc2.encode_rumble_stop()):
+            with self.subTest(words=[hex(word) for word in data_words]):
+                self.assert_edge(self.play(data_words), 0.0, [])
+
+    def test_each_class_alone_still_running(self):
+        for bit, data_words in self.PLAYS.items():
+            for clock in (0.0, 0.549):
+                with self.subTest(bit=bit, clock=clock):
+                    self.assert_edge(self.play(data_words), clock,
+                                     self.SENDS[bit])
+
+    def test_each_class_alone_already_finished(self):
+        # 400 ms and the 150 ms margin after the message.
+        for bit, data_words in self.PLAYS.items():
+            for clock in (0.55, 60.0):
+                with self.subTest(bit=bit, clock=clock):
+                    self.assert_edge(self.play(data_words), clock, [])
+
+    def test_every_session_end_stops_a_running_class(self):
+        for name, end in self.ENDS.items():
+            with self.subTest(end=name):
+                model = self.play(self.PLAYS[sc2.GRIP_PULSE])
+                model.clock = 0.5
+                end(model)
+                self.assertEqual(model.relayed, stop(["81 05", "82 05"]))
+                self.assertEqual(model.queued, STOP["82 05"])
+
+    def test_all_classes_running(self):
+        model = self.play(sc2.encode_rumble(0x1234, 0))
+        for data_words in self.PLAYS.values():
+            self.play(data_words, model=model)
+        self.assert_edge(model, 0.1, ["81 02", "82 02", "81 05", "82 05"],
+                         rumble=True)
+
+    def test_a_long_train_ends_far_in_the_future(self):
+        # 131070 us periods 65535 times: more microseconds than 32 bits hold.
+        train = sc2.report_pulse(0, 0xFFFF, 0xFFFF, 0xFFFF)
+        self.assertGreater(131070 * 65535, 2 ** 32)
+        self.assertEqual(sc2.play_ms(train), 8589673)
+        # Running 2 h later, done 8589673 ms and the margin after it.
+        for clock, names in ((7200.0, ["81 02", "82 02"]),
+                             (8589.822, ["81 02", "82 02"]),
+                             (8589.823, [])):
+            with self.subTest(clock=clock):
+                model = self.play(sc2.encode_pulse(0, 0xFFFF, 0xFFFF,
+                                                   0xFFFF))
+                self.assert_edge(model, clock, names)
+
+    def test_effects_of_no_known_end_run_until_a_stop(self):
+        # A tone or sweep of 0 ms, an undefined 0x82 command.
+        for data_words, names in (
+                (sc2.encode_tone(1, 0, 160, 0, 0, 0), ["81 02", "82 02"]),
+                (sc2.encode_sweep(3, 0, 0, 60, 200), ["81 05", "82 05"]),
+                (sc2.encode_command(2, 3, 0), ["81 02", "82 02"]),
+                (sc2.encode_command(4, 7, 0), ["81 05", "82 05"])):
+            with self.subTest(words=[hex(word) for word in data_words]):
+                self.assert_edge(self.play(data_words), 1e6, names)
+
+    def test_a_shorter_effect_keeps_the_longer_end(self):
+        model = self.play(sc2.encode_tone(0, 0, 160, 2000, 0, 0))
+        self.play(sc2.encode_tone(1, 0, 160, 10, 0, 0), 0.1, model)
+        self.assert_edge(model, 1.0, ["81 02", "82 02"])
+        # The other way round the later end counts too.
+        model = self.play(sc2.encode_tone(0, 0, 160, 10, 0, 0))
+        self.play(sc2.encode_tone(1, 0, 160, 2000, 0, 0), 0.1, model)
+        self.assert_edge(model, 2.249, ["81 02", "82 02"])
 
     def test_a_running_rumble_stops_three_times(self):
-        model = session_model()
-        send(model, sc2.encode_rumble(0x1234, 0))
-        model.relayed.clear()
-        send(model, [sc2.BYE])
-        self.assertEqual(model.relayed, [self.RUMBLE_OFF] * 3 + self.ROUNDS)
+        # Rumble alone: the zero three times, and no repeat.
+        model = self.play(sc2.encode_rumble(0x1234, 0))
+        self.assert_edge(model, 0.0, [], rumble=True)
         # Plain rumble before a HELLO counts the same.
+        send(model, [sc2.BYE])
+        model.relayed.clear()
         model.word(0x0100)
         run(model, sc2.HELLO)
-        self.assertEqual(model.relayed[-1 - 3 - len(self.ROUNDS):],
-                         [sc2.report_plain_rumble(0x0100)]
-                         + [self.RUMBLE_OFF] * 3 + self.ROUNDS)
+        self.assertEqual(model.relayed, [sc2.report_plain_rumble(0x0100)]
+                         + [RUMBLE_OFF] * 3)
 
     def test_nothing_without_a_controller(self):
         model = session_model(linked=False)
-        send(model, sc2.encode_rumble(1, 2) + [sc2.BYE])
+        send(model, sc2.encode_rumble(1, 2)
+             + sc2.encode_tone(0, 0, 160, 0, 0, 0) + [sc2.BYE])
         self.assertEqual(model.relayed, [])
+
+    def test_play_ms(self):
+        self.assertEqual(sc2.play_ms(sc2.report_pulse(0, 2, 40, 6)), 1)
+        self.assertEqual(sc2.play_ms(sc2.report_pulse(0, 1000, 0, 0)), 1)
+        self.assertEqual(sc2.play_ms(sc2.report_pulse(3, 0, 5000, 9)), 0)
+        self.assertEqual(sc2.play_ms(sc2.report_pulse(5, 30000, 30000, 15)),
+                         900)
+        self.assertEqual(sc2.play_ms(sc2.report_tone(3, 0, 65, 2000, 0, 0)),
+                         2000)
+        self.assertEqual(sc2.play_ms(sc2.report_sweep(0, 0, 0xFFFF, 1, 2)),
+                         0xFFFF)
+        self.assertEqual(sc2.play_ms(sc2.report_tone(0, 0, 65, 0, 0, 0)),
+                         math.inf)
+        self.assertEqual(sc2.play_ms(sc2.report_sweep(0, 0, 0, 1, 2)),
+                         math.inf)
+        self.assertEqual([sc2.play_ms(sc2.report_command(2, command, 0))
+                          for command in range(8)],
+                         [0, 0, 0] + [math.inf] * 5)
+        self.assertEqual(sc2.play_ms(sc2.report_script(2, 13, 0)), 0)
+        self.assertEqual(sc2.play_ms(sc2.report_rumble(0xFFFF, 0)), 0)
+        self.assertEqual([sc2.stop_class(sc2.report_pulse(side, 1, 1, 1))
+                          for side in range(6)],
+                         [sc2.PAD_PULSE] * 3 + [sc2.GRIP_PULSE] * 3)
+        self.assertEqual([sc2.stop_class(sc2.report_command(side, 3, 0))
+                          for side in range(6)],
+                         [sc2.PAD_TONE] * 3 + [sc2.GRIP_TONE] * 3)
 
 
 class State(unittest.TestCase):
@@ -438,8 +721,9 @@ class Framing(unittest.TestCase):
                 word = sc2.header(opcode, side << 8)
                 with self.subTest(word=hex(word)):
                     self.assertIsNone(sc2.payload_words(word))
+                    # Nothing played, so the end's stop queued nothing.
                     model = self.assert_rejected([word])
-                    self.assertEqual(model.queued, sc2.STOP_REPORTS[-1])
+                    self.assertEqual(model.queued, b"")
 
     def test_rejected_payloads(self):
         self.assert_rejected([sc2.header(sc2.OP_SCRIPT), 0x0100])
@@ -634,7 +918,6 @@ class RecordingDongle(sc2.Model):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.clock = 0.0
         self.log = []
 
     def _relay(self, report):

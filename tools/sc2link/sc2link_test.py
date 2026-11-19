@@ -287,13 +287,61 @@ def report_tone(side, gain, frequency_hz, duration_ms, lfo_hz, lfo_depth):
                        duration_ms, lfo_hz, lfo_depth)
 
 
-# What a session's start and end queue after a rumble stop, in this order,
-# the whole list STOP_REPEATS times (SC2_STOP in mode_sc2link.cpp). A rumble
-# stop goes out STOP_REPEATS times too while rumble is on (RUMBLE_STOP_REPS in
-# haptics.h). CHECKSUM covers the last report of a session end's stop.
+# The classes of effect a stop tells apart, as bits (SC2_PAD_PULSE and the
+# others in mode_sc2link.cpp): 0x81 on the pads (sides 0 to 2) and on the
+# grips (3 to 5), and a tone, a sweep or an undefined 0x82 command on each.
+PAD_PULSE = 0x01
+GRIP_PULSE = 0x02
+PAD_TONE = 0x04
+GRIP_TONE = 0x08
+# A queued report reaches the controller within a full relay ring, so its
+# effect can start this much later.
+RADIO_MARGIN_MS = 150
+COMMAND_CLICK = 2
+
+# What a session's start and end queue after the 0x80 zero, in this order,
+# the whole list STOP_REPEATS times (SC2_STOP in mode_sc2link.cpp), each
+# report only for a class it is sent for: one that can still run, or one the
+# last stop was sent for while it could. The zero goes out with every stop
+# that sends a report, and alone while the last 0x80 was on: STOP_REPEATS
+# times while it was on (RUMBLE_STOP_REPS in haptics.h), else once. CHECKSUM
+# after a session end covers the last report its stop queued.
 STOP_REPEATS = 3
-STOP_REPORTS = (report_pulse(2, 1, 1, 1), report_command(2, 0, 0),
-                report_command(5, 0, 0))
+STOP_ENTRIES = (
+    (PAD_PULSE | PAD_TONE, report_pulse(2, 1, 1, 1)),
+    (PAD_PULSE | PAD_TONE, report_command(2, 0, 0)),
+    (GRIP_PULSE | GRIP_TONE, report_pulse(5, 1, 1, 1)),
+    (GRIP_PULSE | GRIP_TONE, report_command(5, 0, 0)),
+)
+
+
+def play_ms(report):
+    """How long the effect of a queued report can run, in ms from then
+    without the margin: math.inf with no end known, 0 when no stop is for it
+    (0x80 has its own, none ends 0x85)."""
+    kind = report[0]
+    if kind == 0x81:
+        _, _, on_us, off_us, repeat = struct.unpack("<BBHHH", report)
+        # No on time plays nothing, no repeat is taken as one.
+        if not on_us:
+            return 0
+        return -(-(on_us + off_us) * max(repeat, 1) // 1000)
+    if kind == 0x82:
+        # Tick and click are 18 and 24 ms, 3 to 7 have no known length.
+        return math.inf if report[2] > COMMAND_CLICK else 0
+    if kind in (0x83, 0x84):
+        duration_ms = struct.unpack_from("<H", report,
+                                         5 if kind == 0x83 else 3)[0]
+        return duration_ms or math.inf
+    return 0
+
+
+def stop_class(report):
+    """The class of a report that plays: sides 3 to 5 are the grips."""
+    grips = report[1] > 2
+    if report[0] == 0x81:
+        return GRIP_PULSE if grips else PAD_PULSE
+    return GRIP_TONE if grips else PAD_TONE
 
 
 def crc16(data):
@@ -511,7 +559,8 @@ class Model:
     linked says whether a report reaches the relay: without a linked
     controller the dongle drops it, and CHECKSUM then answers 0xFFFF.
     relayed holds the reports queued for the controller, in order. version
-    is the protocol version the acknowledgements show.
+    is the protocol version the acknowledgements show. clock is the dongle's
+    millis() in seconds, which the caller advances.
     """
 
     def __init__(self, counter=0, linked=True, version=PROTOCOL_VERSION):
@@ -519,9 +568,16 @@ class Model:
         self.linked = linked
         self.version = version
         self.relayed = []
-        # Whether the last 0x80 queued was on, which makes a rumble stop go
-        # out STOP_REPEATS times.
+        self.clock = 0.0
+        # Whether the last 0x80 queued was on: only then does a stop send
+        # the rumble stop, STOP_REPEATS times.
         self.rumble_on = False
+        # Per class bit, the ms until which its effect can run, the margin
+        # included. Kept across sessions.
+        self.running = {}
+        # The classes the last stop was sent for while they could run: the
+        # next stop repeats theirs unless a new effect of the class came.
+        self.repeat = 0
         self.active = False
         self.hello = 0
         self.head = 0
@@ -544,15 +600,47 @@ class Model:
         """BYE, a rejected word or the timeout, with its stop."""
         self.active = False
         self.need = 0
-        self._stop()
-        self.queued = STOP_REPORTS[-1] if self.linked else b""
+        self.queued = self._stop()
+
+    def running_classes(self):
+        now = self._now_ms()
+        classes = 0
+        for bit, until_ms in self.running.items():
+            if until_ms > now:
+                classes |= bit
+        return classes
+
+    def _now_ms(self):
+        return round(self.clock * 1000)
+
+    def _note_running(self, report):
+        ms = play_ms(report)
+        if ms:
+            bit = stop_class(report)
+            until_ms = self._now_ms() + ms + RADIO_MARGIN_MS
+            self.running[bit] = max(self.running.get(bit, 0), until_ms)
 
     def _stop(self):
-        """What a session's start and end queue."""
-        self._relay(report_rumble(0, 0))
+        """What a session's start and end queue: the 0x80 zero and the
+        entries of the classes that can still run or are repeated, the zero
+        alone while rumble is on. The classes that could run are repeated at
+        the next stop. Returns the last report queued, b"" for none."""
+        if not self.linked:
+            return b""
+        running = self.running_classes()
+        classes = running | self.repeat
+        last = b""
+        if classes or self.rumble_on:
+            last = report_rumble(0, 0)
+            self._relay(last)
         for _ in range(STOP_REPEATS):
-            for report in STOP_REPORTS:
-                self._relay(report)
+            for sent_for, report in STOP_ENTRIES:
+                if sent_for & classes:
+                    self._relay(report)
+                    last = report
+        self.running = {}
+        self.repeat = running
+        return last
 
     def _relay(self, report):
         if not self.linked:
@@ -629,6 +717,8 @@ class Model:
         if opcode != OP_CONTROL:
             self._relay(report)
             self.queued = report if self.linked else b""
+            if self.linked:
+                self._note_running(report)
             return last
         if sub == CONTROL_BYE:
             self.end_session()
@@ -1372,9 +1462,16 @@ class SelfTest:
         words, self.toggle = stamp(data_words, self.toggle)
         return words
 
+    def end_session(self):
+        """The model's side of a session the dongle ended by itself."""
+        self.model.clock = time.monotonic()
+        self.model.end_session()
+
     def step(self, word):
         """Problems with one word, empty when the dongle did as predicted."""
         in_session = self.model.active
+        # Effects run out on the dongle's clock, so the model's follows it.
+        self.model.clock = time.monotonic()
         predicted = self.model.word(word)
         if not predicted.accepted:
             if self.link.send_plain(word):
@@ -1407,7 +1504,7 @@ class SelfTest:
         self.link.quiet(SILENCE_S)
         self.link.acks.refresh()
         self.model = Model(self.link.acks.counter(), self.model.linked)
-        self.model.end_session()
+        self.end_session()
         for word in HELLO:
             self.model.word(word)
             if self.link.send(word) is None:
@@ -1523,7 +1620,7 @@ def selftest_copies(test):
     test.case("a rejected word sent twice", doubled(test.stamp([header(7)])))
     test.link.quiet(SILENCE_S)
     test.link.acks.refresh()
-    test.model.end_session()
+    test.end_session()
     test.model.counter = test.link.acks.counter()
     test.hello("HELLO with every word sent twice", doubled(HELLO))
 
@@ -1553,7 +1650,7 @@ def time_out(test, name):
     test.link.quiet(SILENCE_S)
     test.link.acks.refresh()
     state = test.link.acks.state
-    test.model.end_session()
+    test.end_session()
     problems = []
     if state != test.model.state():
         problems.append(f"{format_state(state)}, expected "
@@ -1568,15 +1665,15 @@ def selftest_truncated(test):
         return
     time_out(test, "the session timeout drops it")
     test.hello("HELLO after the timeout opens a new session")
-    test.case("CHECKSUM shows the timeout's stop, not the dropped message",
-              test.stamp([CHECKSUM]))
+    test.case("CHECKSUM shows the timeout's empty stop, not the dropped "
+              "message", test.stamp([CHECKSUM]))
 
 
 def selftest_stop(test):
     """NOPs hold a session, silence ends it with its stop.
 
-    Nothing plays meanwhile: an effect that lasts until the stop would run
-    longer than a second.
+    Nothing plays meanwhile, so the stop queues nothing: an effect that
+    lasts until the stop would run longer than a second.
     """
     problems = []
     for _ in range(5):
@@ -1588,7 +1685,7 @@ def selftest_stop(test):
         return
     time_out(test, "the session times out")
     test.hello("HELLO after the timeout opens a new session")
-    test.case("CHECKSUM shows the last stop report the timeout queued",
+    test.case("CHECKSUM shows the timeout queued no stop report",
               test.stamp([CHECKSUM]))
 
 

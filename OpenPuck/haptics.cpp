@@ -389,6 +389,11 @@ bool hapticRumbleQueue(const uint8_t p[HAPTIC_RUMBLE_LEN], uint8_t slot)
 	return true;
 }
 
+bool hapticRumbleOn(uint8_t slot)
+{
+	return slot < NSLOT && g_rumble80On[slot];
+}
+
 bool hapticSteamRumble(uint16_t lowFreq, uint16_t highFreq, uint8_t slot)
 {
 	if (slot >= NSLOT)
