@@ -12,11 +12,12 @@ bool g_xbox = false;
 uint8_t g_chordBtn[3] = {
 	MODE_LIZARD, MODE_XBOX, MODE_SW_PRO
 }; // back4+B/X/Y -> these modes (A always STEAM); Y defaults to Switch Pro
-// back4+D-pad (left/up/right/down). Defaults are the console personalities that ship WITHOUT a config
+// back4+D-pad (left/up/right/down). Left/up/right default to console personalities that ship WITHOUT a config
 // interface -- those modes can't be entered from the panel-less side any other way, and back4+A still returns
-// to Steam. Configurable like g_chordBtn (WebUSB fields 34..37).
+// to Steam. Down defaults to SC2 Link, whose host is a TV with no browser for the panel. Configurable like
+// g_chordBtn (WebUSB fields 34..37).
 uint8_t g_chordDpad[4] = { MODE_PS3, MODE_DS4_GAME, MODE_PS5_GAME,
-			   MODE_SW_HORI };
+			   MODE_SC2LINK };
 bool g_persistMode = false;
 uint8_t g_bootMode = 0xFF;
 

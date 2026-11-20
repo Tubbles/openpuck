@@ -3881,7 +3881,7 @@ uint8_t rfConnTx(uint8_t ch, uint8_t s1, const uint8_t *payload, uint8_t plen,
 					idx += tlen + 2;
 				}
 				// mode-switch chord (back4 + face/dpad): A=always Steam; B/X/Y=configurable (g_chordBtn[]);
-				// dpad left/up/right/down=configurable (g_chordDpad[], defaults PS3/DS4/PS5/Switch). Debounced.
+				// dpad left/up/right/down=configurable (g_chordDpad[], defaults PS3/DS4/PS5/SC2 Link). Debounced.
 				{
 					// Per-slot debounce: the chord input is per-slot (g_in[g_curSlot]), so the debounce counter
 					// must be too. The shared-static form worked with 1 controller because slot 0 polled

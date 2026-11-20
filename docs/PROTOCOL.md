@@ -419,9 +419,10 @@ synthetic native fixtures are not evidence of acceptance by a real console.
 
 ### 9.5 SC2 Link mode
 
-`MODE_SC2LINK` (`13`), selected by number only (panel `0x03`, console `x13`). One controller for a Linux
-client that reads evdev only, such as a TV streaming app: xpad binds interface 0 as an ordinary Xbox 360 pad,
-hid-generic binds interfaces 1 to 3 as three input nodes carrying the raw state.
+`MODE_SC2LINK` (`13`), selected by number (panel `0x03`, console `x13`) or by the default back-4 + D-pad down
+chord. One controller for a Linux client that reads evdev only, such as a TV streaming app: xpad binds
+interface 0 as an ordinary Xbox 360 pad, hid-generic binds interfaces 1 to 3 as three input nodes carrying the
+raw state.
 
 - VID:PID `045E:028E` (xpad binds an Xbox 360 interface only under a vendor in its table), `bcdDevice=0x5C21`
   (the xpad node's evdev version, which tells this mode from Xbox mode's `0x0114`), device class

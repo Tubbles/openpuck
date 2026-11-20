@@ -59,7 +59,7 @@
 // gyro/accel + BOTH trackpads + battery, all bound natively by SDL3 / Steam Input with no impersonation.
 #define MODE_SINPUT 12
 // SC2 Link: one controller as an Xbox 360 pad for Linux xpad plus three HID nodes carrying its raw state, for a
-// client that reads evdev (a TV streaming app). Panel only, no chord.
+// client that reads evdev (a TV streaming app). Default chord: back4 + D-pad down.
 #define MODE_SC2LINK 13
 #define MODE_MAX 13
 
@@ -122,7 +122,8 @@ extern bool g_xbox;
 extern uint8_t g_chordBtn[3]; // back4+B/X/Y -> these modes (A always STEAM)
 
 // back4+D-pad -> these modes, indexed CHD_LEFT/UP/RIGHT/DOWN. Same deal as g_chordBtn: configurable from the
-// panel, defaults reach the console modes that have no config interface (so a controller-only route in exists).
+// panel, defaults reach modes used away from the panel (console modes that have no config interface, SC2 Link on
+// a TV), so a controller-only route in exists.
 #define CHD_LEFT 0
 #define CHD_UP 1
 #define CHD_RIGHT 2

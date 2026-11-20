@@ -464,10 +464,10 @@
 </div>
 
 <script>
-const MODE_NAMES = ["Steam (puck)","Xbox 360","Switch (HORIPAD)","Lizard (always)","Switch Pro + gyro","PS5 DualSense","HID gyro (DS4)","PS5 (game/clean)","DS4 (game/clean)","PS3 (DualShock 3)","Original Xbox","DirectInput (sims)","SInput (SDL native)"];
+const MODE_NAMES = ["Steam (puck)","Xbox 360","Switch (HORIPAD)","Lizard (always)","Switch Pro + gyro","PS5 DualSense","HID gyro (DS4)","PS5 (game/clean)","DS4 (game/clean)","PS3 (DualShock 3)","Original Xbox","DirectInput (sims)","SInput (SDL native)","SC2 Link"];
 const CHORD_FIELD = [17, 18, 19];          // back4 + B/X/Y
 const CHORD_DPAD_FIELD = [34, 35, 36, 37]; // back4 + D-pad left/up/right/down (firmware protocol >= 18)
-const CHORD_DPAD_DEF = [9, 8, 7, 2];       // firmware defaults: PS3, DS4 game, PS5 game, Switch HORIPAD
+const CHORD_DPAD_DEF = [9, 8, 7, 13];      // firmware defaults: PS3, DS4 game, PS5 game, SC2 Link
 let dev=null, epIn=0, epOut=0, ifNum=0, polling=false, capturing=false, backupBusy=false;
 // A ReversePuck CONTROLLER dongle (28DE:1302) speaks a REDUCED subset of this protocol: no status blob /
 // lizard / config, just a paired-pucks list (0xAC) plus the identical firmware-update + DFU ops. When true,
