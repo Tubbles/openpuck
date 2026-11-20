@@ -16,13 +16,13 @@ Xbox 360 wireless receiver. Original Xbox mode (`MODE_XBOX_OG`, `10`) is separat
 ## Use and constraints
 
 1. Pair the Steam Controller with OpenPuck in Steam mode on a PC first.
-2. In the WebUSB panel, enable **Persist last mode** before selecting Xbox
-  mode. It is off by default: unplugging the puck otherwise boots it back
-  into Steam mode, even if Xbox mode was selected before unplugging.
+2. In the WebUSB panel, check that **Persist last mode** is on before selecting
+  Xbox mode. It is on by default; with it off, unplugging the puck boots it
+  back into Steam mode, even if Xbox mode was selected before unplugging.
 3. Hold **all four back buttons (L4 + R4 + L5 + R5) + X** to enter Xbox mode
    with the default chord assignment.
 4. Unplug from the PC and connect to the console. With persistence enabled,
-  the puck boots into Xbox mode. Alternatively, leave persistence off and
+  the puck boots into Xbox mode. Alternatively, turn persistence off and
   select Xbox mode with the controller chord after connecting to the console.
 5. To configure mappings/rumble or update firmware, connect OpenPuck to a PC and
    use **back-4 + A** for Steam mode, then open the WebUSB panel. Return with

@@ -186,7 +186,8 @@ Two files in the nRF52 internal LittleFS:
   firmware updates preserve learned RF history. A full-board wipe intentionally clears the journal too.
 
 Mode switches (chord, WebUSB, or CDC) call `saveMode()` then reboot so the next boot enumerates the right
-interface set. By default every cold boot returns to Steam mode unless "persist last mode" is enabled.
+interface set. "Persist last mode" is on by default, so a cold boot returns to the last selected mode; with it
+off, every cold boot returns to Steam mode.
 
 ## Config & debug surfaces
 

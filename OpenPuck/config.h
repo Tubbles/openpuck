@@ -130,10 +130,10 @@ extern uint8_t g_chordBtn[3]; // back4+B/X/Y -> these modes (A always STEAM)
 #define CHD_DOWN 3
 extern uint8_t g_chordDpad[4];
 
-// Mode persistence policy: by DEFAULT every fresh power-on/reconnect lands in STEAM mode (0). An explicit
-// mode switch still works for the session via a ONE-SHOT bootMode (honored once, then cleared). g_persistMode
-// instead remembers the last selected mode across reboots.
-// false (default) = always boot Steam; true = boot into last mode
+// Mode persistence policy: by DEFAULT g_persistMode remembers the last selected mode across reboots. With it
+// off, every fresh power-on/reconnect lands in STEAM mode (0), and an explicit mode switch still works for the
+// session via a ONE-SHOT bootMode (honored once, then cleared).
+// true (default) = boot into last mode; false = always boot Steam
 extern bool g_persistMode;
 // one-shot: boot into this mode once then clear (!persistMode + explicit switch)
 extern uint8_t g_bootMode;
